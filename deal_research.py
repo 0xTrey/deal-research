@@ -469,9 +469,12 @@ def search_linkedin_contacts_with_tavily(company_name):
 
         print(f"  [Tavily] Found {len(all_profiles)} unique LinkedIn profiles")
 
-        # Check if we got enough results
+        # Validate and fix URLs before passing to Gemini
+        all_profiles = validate_and_fix_linkedin_urls(all_profiles, company_name)
+
+        # Check if we got enough results after validation
         if len(all_profiles) < 5:
-            print("  [Tavily] Too few results, falling back to Gemini Google Search...")
+            print("  [Tavily] Too few valid results, falling back to Gemini Google Search...")
             return search_linkedin_contacts_with_gemini(company_name)
 
         # Pass 2: Use Gemini to format the raw profile data
@@ -568,6 +571,154 @@ Now format the contacts:"""
         print(f"  [Tavily] Error: {e}")
         print("  [Tavily] Falling back to Gemini Google Search...")
         return search_linkedin_contacts_with_gemini(company_name)
+
+
+def validate_and_fix_linkedin_urls(profiles, company_name):
+    """
+    Validate LinkedIn URLs and fix encoding issues.
+    LinkedIn blocks HEAD requests (405), so we check for obvious issues:
+    - URL encoding problems (like %C3%BC instead of proper UTF-8)
+    - 404/999 responses (invalid profiles or rate limiting)
+
+    Args:
+        profiles: dict of {url: profile_data}
+        company_name: str
+
+    Returns:
+        dict of validated {url: profile_data} with corrected URLs
+    """
+    print(f"  [Validation] Checking {len(profiles)} LinkedIn URLs...")
+
+    validated_profiles = {}
+    fixed_count = 0
+    skipped_count = 0
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    for url, data in profiles.items():
+        # Check for URL encoding issues (common problem with international names)
+        has_encoding_issue = '%' in url and any(
+            pattern in url for pattern in ['%C3%', '%C2%', '%E2%', '%C4%', '%C5%']
+        )
+
+        if has_encoding_issue:
+            print(f"    [!] URL has encoding issues: {url[:60]}...")
+            # Try to find correct URL via Google
+            fixed_url = find_linkedin_url_via_google(data, company_name)
+            if fixed_url and fixed_url != url:
+                print(f"    [+] Found corrected URL via Google")
+                data['url'] = fixed_url
+                validated_profiles[fixed_url] = data
+                fixed_count += 1
+            else:
+                # Keep original if we can't fix it
+                validated_profiles[url] = data
+            time.sleep(0.5)
+            continue
+
+        # For URLs without obvious issues, try a quick GET request
+        # to check if the profile exists (LinkedIn blocks HEAD)
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=5,
+                allow_redirects=True,
+                stream=True  # Don't download full response
+            )
+            # Close immediately - we only need the status code
+            response.close()
+
+            # 200 = valid, 404 = not found, 999 = rate limited
+            if response.status_code == 200:
+                validated_profiles[url] = data
+            elif response.status_code in [404, 999]:
+                print(f"    [x] Invalid URL (HTTP {response.status_code}): {url[:60]}...")
+                fixed_url = find_linkedin_url_via_google(data, company_name)
+                if fixed_url and fixed_url != url:
+                    print(f"    [+] Found corrected URL via Google")
+                    data['url'] = fixed_url
+                    validated_profiles[fixed_url] = data
+                    fixed_count += 1
+                else:
+                    skipped_count += 1
+                time.sleep(0.5)
+            else:
+                # Other status codes (403, etc.) - keep the URL
+                validated_profiles[url] = data
+
+        except requests.RequestException:
+            # Connection errors - keep the URL (may still work for users)
+            validated_profiles[url] = data
+
+    print(f"  [Validation] {len(validated_profiles)} valid URLs ({fixed_count} corrected, {skipped_count} removed)")
+    return validated_profiles
+
+
+def find_linkedin_url_via_google(profile_data, company_name):
+    """
+    Attempt to find correct LinkedIn URL by searching Google.
+    Extracts name and title from profile data, searches Google, parses results.
+
+    Args:
+        profile_data: dict with 'title', 'snippet', 'url'
+        company_name: str
+
+    Returns:
+        str: corrected LinkedIn URL or None
+    """
+    try:
+        # Extract name from title (usually "Name - Title | LinkedIn" or similar)
+        title = profile_data.get('title', '')
+
+        # Common patterns in LinkedIn search results:
+        # "Peter Juntgen - VP Marketing | LinkedIn"
+        # "Jane Smith | LinkedIn"
+        name = ''
+        if ' - ' in title:
+            name = title.split(' - ')[0].strip()
+        elif '|' in title:
+            name = title.split('|')[0].strip()
+        else:
+            # Fallback: use the whole title minus common suffixes
+            name = title.replace('| LinkedIn', '').replace('- LinkedIn', '').strip()
+
+        if not name or len(name) < 3:
+            return None
+
+        # Build a Google search query
+        search_query = f'"{name}" "{company_name}" site:linkedin.com/in'
+
+        # Use Google search via requests
+        search_url = f"https://www.google.com/search?q={quote_plus(search_query)}&num=3"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+
+        response = requests.get(search_url, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        # Parse HTML to find LinkedIn URLs
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Look for LinkedIn URLs in search results
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            # Google wraps URLs in /url?q=...
+            if '/url?q=' in href:
+                actual_url = href.split('/url?q=')[1].split('&')[0]
+                if 'linkedin.com/in/' in actual_url:
+                    return actual_url
+            elif 'linkedin.com/in/' in href:
+                return href
+
+        return None
+
+    except Exception as e:
+        # Silently fail - we'll just skip this profile
+        return None
 
 
 # =============================================================================
