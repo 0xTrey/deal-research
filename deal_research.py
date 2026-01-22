@@ -7,9 +7,17 @@ Usage: python deal_research.py "Company Name" "domain.com"
 This tool:
 1. Fetches company data from Apollo API
 2. Detects tech stack via web scraping
-3. Searches for LinkedIn contacts via Google
-4. Uses Gemini API to synthesize research sections
-5. Creates a formatted Google Doc in the specified folder
+3. Searches for LinkedIn contacts via Tavily API + Gemini formatting
+4. Gathers recent news and activity via Tavily API
+5. Uses Gemini API to synthesize research sections
+6. Creates a formatted Google Doc in the specified folder
+
+Requirements:
+- Apollo API key (required)
+- Gemini API key (required)
+- Tavily API key (optional - improves LinkedIn search quality and enables news section)
+- Google OAuth credentials (required)
+- Google Drive folder ID (required)
 """
 
 import json
@@ -26,6 +34,13 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+
+# Tavily import - optional, will fail gracefully if not installed
+try:
+    from tavily import TavilyClient
+    TAVILY_AVAILABLE = True
+except ImportError:
+    TAVILY_AVAILABLE = False
 
 # =============================================================================
 # CONFIGURATION
@@ -46,9 +61,15 @@ def load_config():
         print("Please copy .env.example to .env and fill in your API keys.")
         sys.exit(1)
 
+    # Tavily is optional - will fall back to Gemini if not configured
+    tavily_key = os.environ.get("TAVILY_API_KEY")
+    if not tavily_key:
+        print("  Note: TAVILY_API_KEY not set - will use Gemini for LinkedIn search")
+
     return {
         "apollo_api_key": os.environ["APOLLO_API_KEY"],
         "gemini_api_key": os.environ["GEMINI_API_KEY"],
+        "tavily_api_key": tavily_key,
         "google_drive_folder_id": os.environ["GOOGLE_DRIVE_FOLDER_ID"],
         "google_credentials_path": os.path.expanduser(
             os.environ.get("GOOGLE_CREDENTIALS_PATH", "~/.config/deal-research/credentials.json")
@@ -369,6 +390,331 @@ Now search and find the contacts at {company_name}:"""
     except Exception as e:
         print(f"  [Gemini Deep Research] Error: {e}")
         return ""
+
+
+def search_linkedin_contacts_with_tavily(company_name):
+    """
+    Use Tavily API + Gemini to find and format LinkedIn contacts.
+
+    Two-pass approach:
+    1. Pass 1: Tavily searches LinkedIn for profile URLs (10-15 targeted queries)
+    2. Pass 2: Gemini formats the raw results into structured contact entries
+
+    Returns the same plain text format as the original Gemini-only function.
+    Falls back to Gemini Google Search if Tavily fails or returns few results.
+    """
+    config = get_config()
+
+    # Check if Tavily is available and configured
+    if not TAVILY_AVAILABLE or not config.get("tavily_api_key"):
+        print("  [Tavily] Not available, falling back to Gemini Google Search...")
+        return search_linkedin_contacts_with_gemini(company_name)
+
+    print(f"  [Tavily] Searching for LinkedIn contacts at {company_name}...")
+
+    try:
+        tavily = TavilyClient(api_key=config["tavily_api_key"])
+
+        # Define targeted search queries for different roles
+        # Each query targets specific executive/marketing roles
+        search_queries = [
+            f'site:linkedin.com/in "{company_name}" CEO',
+            f'site:linkedin.com/in "{company_name}" CMO',
+            f'site:linkedin.com/in "{company_name}" CRO',
+            f'site:linkedin.com/in "{company_name}" CFO',
+            f'site:linkedin.com/in "{company_name}" COO',
+            f'site:linkedin.com/in "{company_name}" Founder',
+            f'site:linkedin.com/in "{company_name}" "VP Marketing"',
+            f'site:linkedin.com/in "{company_name}" "Vice President Marketing"',
+            f'site:linkedin.com/in "{company_name}" "Director Marketing"',
+            f'site:linkedin.com/in "{company_name}" "Demand Generation"',
+            f'site:linkedin.com/in "{company_name}" "ABM"',
+            f'site:linkedin.com/in "{company_name}" "Marketing Operations"',
+            f'site:linkedin.com/in "{company_name}" "Digital Marketing"',
+            f'site:linkedin.com/in "{company_name}" "Growth Marketing"',
+        ]
+
+        # Collect all unique LinkedIn profiles from searches
+        all_profiles = {}  # URL -> profile data (deduplication)
+
+        for i, query in enumerate(search_queries):
+            try:
+                print(f"    [{i+1}/{len(search_queries)}] Searching: {query[:60]}...")
+
+                response = tavily.search(
+                    query=query,
+                    search_depth="advanced",
+                    include_domains=["linkedin.com"],
+                    max_results=5
+                )
+
+                results = response.get("results", [])
+                for result in results:
+                    url = result.get("url", "")
+                    # Only include linkedin.com/in/ profiles (not company pages)
+                    if "linkedin.com/in/" in url and url not in all_profiles:
+                        all_profiles[url] = {
+                            "url": url,
+                            "title": result.get("title", ""),
+                            "snippet": result.get("content", ""),
+                            "query": query
+                        }
+
+                # Brief pause to avoid rate limiting
+                time.sleep(0.3)
+
+            except Exception as e:
+                print(f"    Warning: Query failed - {e}")
+                continue
+
+        print(f"  [Tavily] Found {len(all_profiles)} unique LinkedIn profiles")
+
+        # Check if we got enough results
+        if len(all_profiles) < 5:
+            print("  [Tavily] Too few results, falling back to Gemini Google Search...")
+            return search_linkedin_contacts_with_gemini(company_name)
+
+        # Pass 2: Use Gemini to format the raw profile data
+        print("  [Gemini] Formatting contact information...")
+
+        # Prepare profile data for Gemini
+        profiles_text = ""
+        for url, data in list(all_profiles.items())[:25]:  # Limit to 25 profiles
+            profiles_text += f"""
+URL: {data['url']}
+Title/Name from Search: {data['title']}
+Snippet: {data['snippet']}
+Search Query Used: {data['query']}
+---
+"""
+
+        # Gemini formatting prompt - emphasizes exact output format
+        format_prompt = f"""# ROLE
+Act as an Executive Sales Researcher. Your task is to format LinkedIn contact data into a structured list.
+
+# RAW DATA
+Below are LinkedIn profile URLs and snippets found for people at {company_name}:
+
+{profiles_text}
+
+# TASK
+Using ONLY the data provided above, format each person into the contact format below.
+Focus on these roles in priority order:
+1. C-Suite (CEO, CMO, CRO, CFO, COO) and Founders
+2. VPs and Directors in Marketing, Sales, or Revenue
+3. Anyone with ABM, Demand Generation, or Marketing Operations in their title
+
+# CRITICAL FORMATTING INSTRUCTIONS
+This output will be pasted into Google Docs which does NOT render markdown.
+DO NOT use any markdown syntax (no **, no *, no #, no [], no ()).
+
+Use this EXACT plain text format for each contact:
+
+CONTACT NAME
+Title: [Their Current Title at {company_name}]
+LinkedIn: [Full URL exactly as provided]
+Tenure: [Time at company if mentioned in snippet, otherwise "Verify on profile"]
+Location: [City, State/Country if mentioned, otherwise "Verify on profile"]
+Insight: [Brief note from the snippet about their background or expertise]
+
+(blank line between contacts)
+
+# RULES
+1. Only include people who appear to CURRENTLY work at {company_name}
+2. Use the exact LinkedIn URL provided - do not modify it
+3. Extract name from the search title (usually "Name - Title | LinkedIn")
+4. If information is not available in the snippet, write "Verify on profile"
+5. Order contacts by seniority (C-Suite first, then VPs, then Directors, then others)
+6. Aim to include 10-20 contacts if data is available
+
+Now format the contacts:"""
+
+        # Call Gemini API for formatting
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={config['gemini_api_key']}"
+
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [{"parts": [{"text": format_prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": 8192,
+                "temperature": 0.3,  # Lower temp for more consistent formatting
+            }
+        }
+
+        response = requests.post(url, headers=headers, json=payload, timeout=120)
+        response.raise_for_status()
+        data = response.json()
+
+        # Extract formatted text
+        candidates = data.get("candidates", [])
+        if candidates:
+            content = candidates[0].get("content", {})
+            parts = content.get("parts", [])
+            result_parts = []
+            for part in parts:
+                if "text" in part:
+                    result_parts.append(part["text"])
+            result = "\n".join(result_parts)
+
+            # Count contacts in result
+            contact_count = result.lower().count("linkedin.com/in/")
+            print(f"  [Tavily+Gemini] Formatted {contact_count} contacts")
+            return result
+
+        print("  [Tavily] Formatting failed, falling back to Gemini Google Search...")
+        return search_linkedin_contacts_with_gemini(company_name)
+
+    except Exception as e:
+        print(f"  [Tavily] Error: {e}")
+        print("  [Tavily] Falling back to Gemini Google Search...")
+        return search_linkedin_contacts_with_gemini(company_name)
+
+
+# =============================================================================
+# TAVILY NEWS & RECENT ACTIVITY
+# =============================================================================
+
+def generate_news_and_activity(company_name, domain):
+    """
+    Use Tavily to find recent news and activity about the company.
+    Returns plain text formatted for Google Docs (no markdown).
+    """
+    config = get_config()
+
+    # Check if Tavily is available and configured
+    if not TAVILY_AVAILABLE or not config.get("tavily_api_key"):
+        print("  [News] Tavily not available - skipping news section")
+        return "News section requires Tavily API. Please configure TAVILY_API_KEY."
+
+    print(f"  [Tavily] Searching for recent news about {company_name}...")
+
+    try:
+        tavily = TavilyClient(api_key=config["tavily_api_key"])
+
+        # Define search queries for different types of news
+        news_queries = [
+            f'"{company_name}" news announcement 2026 2025',
+            f'"{company_name}" press release',
+            f'"{company_name}" funding round investment',
+            f'"{company_name}" product launch announcement',
+            f'"{company_name}" partnership announcement',
+            f'"{company_name}" executive hire CEO CMO CRO',
+        ]
+
+        all_news = {}  # URL -> news item (deduplication)
+
+        for query in news_queries:
+            try:
+                response = tavily.search(
+                    query=query,
+                    search_depth="advanced",
+                    max_results=5
+                )
+
+                results = response.get("results", [])
+                for result in results:
+                    url = result.get("url", "")
+                    if url not in all_news:
+                        # Extract domain for source name
+                        source = url.split("/")[2] if "/" in url else "Unknown"
+                        source = source.replace("www.", "").split(".")[0].title()
+
+                        all_news[url] = {
+                            "url": url,
+                            "title": result.get("title", ""),
+                            "content": result.get("content", ""),
+                            "source": source,
+                            "published_date": result.get("published_date", "")
+                        }
+
+                time.sleep(0.2)
+
+            except Exception as e:
+                print(f"    Warning: News query failed - {e}")
+                continue
+
+        print(f"  [Tavily] Found {len(all_news)} news items")
+
+        if not all_news:
+            return "No recent news found. Consider manual research for this company."
+
+        # Format news items using Gemini for consistent output
+        news_text = ""
+        for url, item in list(all_news.items())[:15]:  # Limit to 15 items
+            news_text += f"""
+Title: {item['title']}
+Source: {item['source']}
+URL: {item['url']}
+Content: {item['content'][:500]}
+Published: {item['published_date'] or 'Unknown'}
+---
+"""
+
+        format_prompt = f"""# ROLE
+You are a business research analyst summarizing recent news about {company_name}.
+
+# RAW NEWS DATA
+{news_text}
+
+# TASK
+Format the most relevant news items (5-10 items max) into a clean summary.
+
+# CRITICAL FORMATTING INSTRUCTIONS
+This output will be pasted into Google Docs which does NOT render markdown.
+DO NOT use any markdown syntax (no **, no *, no #, no [], no ()).
+
+Use this EXACT plain text format for each news item:
+
+[Date or "Recent"] - [Headline]
+Source: [Publication Name]
+Summary: [2-3 sentence summary of the key points]
+
+(blank line between items)
+
+# RULES
+1. Order by relevance and recency (most important/recent first)
+2. Include 5-10 items maximum
+3. Skip duplicate stories or very similar items
+4. Focus on business-relevant news: funding, partnerships, products, executive changes
+5. Write clear, factual summaries without hype
+6. If date is unknown, use "Recent" as the date
+
+Now format the news items:"""
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={config['gemini_api_key']}"
+
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [{"parts": [{"text": format_prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": 4096,
+                "temperature": 0.3,
+            }
+        }
+
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+
+        candidates = data.get("candidates", [])
+        if candidates:
+            content = candidates[0].get("content", {})
+            parts = content.get("parts", [])
+            result_parts = []
+            for part in parts:
+                if "text" in part:
+                    result_parts.append(part["text"])
+            result = "\n".join(result_parts)
+
+            news_count = result.count("Source:")
+            print(f"  [News] Formatted {news_count} news items")
+            return result
+
+        return "Error formatting news. Raw data was collected but formatting failed."
+
+    except Exception as e:
+        print(f"  [News] Error: {e}")
+        return f"Error fetching news: {str(e)}"
 
 
 # =============================================================================
@@ -703,6 +1049,7 @@ def apply_text_formatting(docs_service, doc_id, full_text):
 
     # Define patterns to make bold (labels followed by colons)
     bold_labels = [
+        # Company Research section
         "LinkedIn Employee Count:",
         "Estimated Annual Revenue:",
         "Estimated Company Value:",
@@ -717,11 +1064,15 @@ def apply_text_formatting(docs_service, doc_id, full_text):
         "History:",
         "Product Overview:",
         "Product Differentiation:",
+        # Contacts section
         "Title:",
         "LinkedIn:",
         "Tenure:",
         "Location:",
         "Insight:",
+        # News & Recent Activity section
+        "Source:",
+        "Summary:",
     ]
 
     # Apply bold to labels
@@ -821,9 +1172,9 @@ def apply_text_formatting(docs_service, doc_id, full_text):
     return format_requests
 
 
-def create_google_doc(company_name, company_research, techstack, contacts):
+def create_google_doc(company_name, company_research, techstack, contacts, news_and_activity=""):
     """Create a Google Doc with the research content."""
-    print("\n[Step 5/5] Creating Google Doc...")
+    print("\n[Step 6/6] Creating Google Doc...")
 
     creds = get_google_credentials()
     if not creds:
@@ -872,6 +1223,8 @@ def create_google_doc(company_name, company_research, techstack, contacts):
         {"text": techstack + "\n\n", "style": None},
         {"text": "Contacts\n", "style": "HEADING_1"},
         {"text": contacts + "\n\n", "style": None},
+        {"text": "News & Recent Activity\n", "style": "HEADING_1"},
+        {"text": news_and_activity + "\n\n", "style": None},
         {"text": "Call Notes\n", "style": "HEADING_1"},
         {"text": "Notes from Granola will be added here via Zapier integration.\n", "style": None},
     ]
@@ -965,7 +1318,7 @@ def main():
     print(f"{'='*60}\n")
 
     # Step 1: Fetch Apollo data
-    print("[Step 1/5] Fetching company data from Apollo API...")
+    print("[Step 1/6] Fetching company data from Apollo API...")
     apollo_data = fetch_apollo_data(domain)
     if not apollo_data:
         apollo_data = {
@@ -976,11 +1329,11 @@ def main():
         print("  Warning: Using minimal data (Apollo enrichment failed)")
 
     # Step 2: Scrape website for tech stack
-    print("\n[Step 2/5] Scanning website for tech stack...")
+    print("\n[Step 2/6] Scanning website for tech stack...")
     scraped_tech = scrape_website_tech_stack(domain)
 
     # Step 3: Generate LLM-synthesized sections
-    print("\n[Step 3/5] Generating research sections with Gemini...")
+    print("\n[Step 3/6] Generating research sections with Gemini...")
 
     print("\n  Generating Company Research...")
     company_research = generate_company_research(apollo_data, company_name)
@@ -996,14 +1349,20 @@ def main():
     if not techstack:
         techstack = "Error generating tech stack analysis. Please add manually."
 
-    # Step 4: Deep research for LinkedIn contacts using Gemini with Google Search
-    print("\n[Step 4/5] Deep research for LinkedIn contacts...")
-    contacts = search_linkedin_contacts_with_gemini(company_name)
+    # Step 4: Deep research for LinkedIn contacts using Tavily + Gemini
+    print("\n[Step 4/6] Searching for LinkedIn contacts...")
+    contacts = search_linkedin_contacts_with_tavily(company_name)
     if not contacts:
         contacts = "Error finding contacts. Please add manually."
 
-    # Step 5: Create Google Doc
-    doc_url = create_google_doc(company_name, company_research, techstack, contacts)
+    # Step 5: Gather recent news and activity using Tavily
+    print("\n[Step 5/6] Gathering recent news and activity...")
+    news_and_activity = generate_news_and_activity(company_name, domain)
+    if not news_and_activity:
+        news_and_activity = "Error gathering news. Please add manually."
+
+    # Step 6: Create Google Doc
+    doc_url = create_google_doc(company_name, company_research, techstack, contacts, news_and_activity)
 
     # Summary
     print(f"\n{'='*60}")
@@ -1014,7 +1373,8 @@ def main():
     print(f"\nData collected:")
     print(f"  - Apollo enrichment: {'Success' if apollo_data.get('industry') else 'Partial'}")
     print(f"  - Tech stack detected: {len(scraped_tech)} technologies from website")
-    print(f"  - LinkedIn contacts: Gemini deep research completed")
+    print(f"  - LinkedIn contacts: Tavily + Gemini search completed")
+    print(f"  - News & Activity: Tavily search completed")
     print(f"\n{'='*60}\n")
 
 
