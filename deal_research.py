@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import time
+import webbrowser
 from datetime import datetime
 from urllib.parse import quote_plus
 
@@ -1521,6 +1522,8 @@ def main():
     print(f"{'='*60}")
     if doc_url:
         print(f"\nGoogle Doc: {doc_url}")
+        print("  Opening in browser...")
+        webbrowser.open(doc_url)
     print(f"\nData collected:")
     print(f"  - Apollo enrichment: {'Success' if apollo_data.get('industry') else 'Partial'}")
     print(f"  - Tech stack detected: {len(scraped_tech)} technologies from website")
