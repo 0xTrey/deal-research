@@ -2,7 +2,7 @@
 """
 Deal Research Generator - Creates pre-filled Google Docs for sales deal research.
 
-Usage: python deal_research.py "Company Name" "domain.com"
+Usage: python deal_research.py "Company Name" "domain.com" ["Champion Name"]
 
 This tool:
 1. Fetches company data from Apollo API
@@ -32,6 +32,7 @@ from urllib.parse import quote_plus
 import requests
 from bs4 import BeautifulSoup
 from google.auth.transport.requests import Request
+from llm_gateway import LLMGateway
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -54,6 +55,10 @@ def load_config():
         load_dotenv()
     except ImportError:
         pass  # dotenv not installed, rely on system environment variables
+
+    # Support AI_GEMINI_KEY (gateway convention) as fallback for GEMINI_API_KEY
+    if not os.environ.get("GEMINI_API_KEY") and os.environ.get("AI_GEMINI_KEY"):
+        os.environ["GEMINI_API_KEY"] = os.environ["AI_GEMINI_KEY"]
 
     required = ["APOLLO_API_KEY", "GEMINI_API_KEY", "GOOGLE_DRIVE_FOLDER_ID"]
     missing = [key for key in required if not os.environ.get(key)]
@@ -282,9 +287,6 @@ def scrape_website_tech_stack(domain):
 def search_linkedin_contacts_with_gemini(company_name):
     """Use Gemini with Google Search grounding to find LinkedIn contacts."""
     print(f"  [Gemini Deep Research] Searching for contacts at {company_name}...")
-    config = get_config()
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={config['gemini_api_key']}"
 
     prompt = f"""# ROLE
 Act as an Executive Sales Researcher. Your goal is to identify high-value decision-makers at {company_name} by searching LinkedIn.
@@ -344,46 +346,13 @@ Insight: Built demand gen team from scratch, expertise in 6sense and Marketo
 
 Now search and find the contacts at {company_name}:"""
 
-    headers = {"Content-Type": "application/json"}
-
-    payload = {
-        "contents": [{
-            "parts": [{"text": prompt}]
-        }],
-        "generationConfig": {
-            "maxOutputTokens": 8192,
-            "temperature": 0.7,
-        },
-        "tools": [{
-            "google_search": {}
-        }]
-    }
-
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=120)
-        response.raise_for_status()
-        data = response.json()
+        result = _call_gemini_grounded(prompt, max_tokens=8192)
 
-        # Extract generated text from all parts
-        candidates = data.get("candidates", [])
-        if candidates:
-            content = candidates[0].get("content", {})
-            parts = content.get("parts", [])
-
-            # Combine text from all parts
-            result_parts = []
-            for part in parts:
-                if "text" in part:
-                    result_parts.append(part["text"])
-
-            result = "\n".join(result_parts)
-
-            # Count approximate contacts found (look for common LinkedIn patterns)
+        if result:
             contact_count = result.lower().count("linkedin.com/in/") + result.lower().count("linkedin profile")
-            # Also count by looking for name patterns with titles
             name_count = len([line for line in result.split('\n') if '**Name:**' in line or '**Title:**' in line])
             contact_estimate = max(contact_count, name_count // 2)
-
             print(f"  [Gemini Deep Research] Found ~{contact_estimate} contacts")
             return result
 
@@ -393,16 +362,227 @@ Now search and find the contacts at {company_name}:"""
         return ""
 
 
+def search_champion_contact(champion_name, company_name):
+    """
+    Search for a specific champion contact on LinkedIn using Gemini grounded search.
+
+    Args:
+        champion_name: full name of the champion (e.g. "Rajiv Chidambaram")
+        company_name: company they work at
+
+    Returns:
+        tuple: (champion_text, champion_url) or (None, None) if not found.
+        champion_text is in the standard contact format (Name, Title, LinkedIn, etc.)
+    """
+    print(f"  [Champion] Searching for {champion_name} at {company_name}...")
+
+    prompt = f"""Search LinkedIn for "{champion_name}" who works at "{company_name}".
+
+Find their LinkedIn profile and provide the following information:
+
+{champion_name}
+Title: [their current title at {company_name}]
+LinkedIn: [full LinkedIn profile URL like https://www.linkedin.com/in/username]
+Tenure: [time at company if available]
+Location: [city, state/country if available]
+Insight: [brief background note from their profile]
+
+Only return information if you find a LinkedIn profile that matches this person at {company_name}.
+Do not use markdown formatting. Use plain text only."""
+
+    try:
+        result = _call_gemini_grounded(prompt, max_tokens=2048)
+        if not result:
+            print(f"  [Champion] Could not find {champion_name}")
+            return None, None
+
+        # Extract LinkedIn URL from result
+        url_match = re.search(r'https?://(?:www\.)?linkedin\.com/in/[^\s,)]+', result)
+        if not url_match:
+            print(f"  [Champion] No LinkedIn URL found for {champion_name}")
+            return None, None
+
+        champion_url = url_match.group(0).rstrip('.')
+
+        # Clean up the result to match expected format
+        # Ensure it starts with the champion name and uses our format
+        lines = result.strip().split('\n')
+        cleaned_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # Skip markdown artifacts or preamble
+            if stripped.startswith(('#', '*', '```')):
+                continue
+            cleaned_lines.append(stripped)
+
+        champion_text = '\n'.join(cleaned_lines)
+        print(f"  [Champion] Found {champion_name}: {champion_url}")
+        return champion_text, champion_url
+
+    except Exception as e:
+        print(f"  [Champion] Error searching for {champion_name}: {e}")
+        return None, None
+
+
+def deduplicate_champion_from_contacts(contacts_text, champion_url, champion_name):
+    """
+    Remove any contact block from contacts_text that matches the champion
+    by URL or by name (case-insensitive partial match).
+
+    Contact blocks are separated by blank lines.
+
+    Args:
+        contacts_text: the full contacts string
+        champion_url: LinkedIn URL of the champion
+        champion_name: name of the champion
+
+    Returns:
+        str: contacts_text with the champion's block removed
+    """
+    if not contacts_text:
+        return contacts_text
+
+    # Split into blocks separated by blank lines
+    blocks = re.split(r'\n\s*\n', contacts_text)
+    filtered = []
+    champion_lower = champion_name.lower()
+
+    for block in blocks:
+        block_stripped = block.strip()
+        if not block_stripped:
+            continue
+
+        # Check URL match
+        if champion_url and champion_url in block_stripped:
+            continue
+
+        # Check name match (case-insensitive, partial)
+        first_line = block_stripped.split('\n')[0].strip().lower()
+        if champion_lower in first_line or first_line in champion_lower:
+            continue
+
+        filtered.append(block_stripped)
+
+    return '\n\n'.join(filtered)
+
+
+def _tavily_linkedin_search(tavily_client, queries, company_name):
+    """
+    Run a batch of Tavily searches for LinkedIn profiles.
+
+    Args:
+        tavily_client: initialized TavilyClient
+        queries: list of search query strings
+        company_name: str for logging
+
+    Returns:
+        dict of {url: profile_data}
+    """
+    profiles = {}
+
+    for i, query in enumerate(queries):
+        try:
+            print(f"    [{i+1}/{len(queries)}] Searching: {query[:60]}...")
+
+            response = tavily_client.search(
+                query=query,
+                search_depth="advanced",
+                include_domains=["linkedin.com"],
+                max_results=5
+            )
+
+            results = response.get("results", [])
+            for result in results:
+                url = result.get("url", "")
+                if "linkedin.com/in/" in url and url not in profiles:
+                    profiles[url] = {
+                        "url": url,
+                        "title": result.get("title", ""),
+                        "snippet": result.get("content", ""),
+                        "query": query
+                    }
+
+            time.sleep(0.3)
+
+        except Exception as e:
+            print(f"    Warning: Query failed - {e}")
+            continue
+
+    return profiles
+
+
+def _gemini_grounded_linkedin_search(roles, company_name):
+    """
+    Single Gemini grounded call to search LinkedIn for multiple roles at once.
+
+    Args:
+        roles: list of role strings (e.g. ["Director Marketing", "ABM"])
+        company_name: str
+
+    Returns:
+        dict of {url: profile_data}
+    """
+    role_queries = "\n".join(
+        f'site:linkedin.com/in "{company_name}" "{role}"' for role in roles
+    )
+
+    prompt = f"""Search LinkedIn for people currently working at {company_name} in these roles:
+
+{role_queries}
+
+For each person found, provide:
+Name
+Title: [their title]
+LinkedIn: [full LinkedIn profile URL]
+Snippet: [brief background from the profile]
+
+Only include people who currently work at {company_name}. Include the actual linkedin.com/in/ URL for each person."""
+
+    try:
+        result = _call_gemini_grounded(prompt, max_tokens=4096)
+        time.sleep(1)  # Gemini rate limits are tighter than Tavily
+    except Exception as e:
+        print(f"    Warning: Gemini grounded search failed - {e}")
+        return {}
+
+    if not result:
+        return {}
+
+    # Parse response for LinkedIn URLs and surrounding context
+    profiles = {}
+    lines = result.split('\n')
+    for i, line in enumerate(lines):
+        urls = re.findall(r'https?://(?:www\.)?linkedin\.com/in/[^\s,)]+', line)
+        for url in urls:
+            url = url.rstrip('.')
+            if url not in profiles:
+                # Grab surrounding lines as context
+                context_start = max(0, i - 3)
+                context_end = min(len(lines), i + 2)
+                context = '\n'.join(lines[context_start:context_end])
+                profiles[url] = {
+                    "url": url,
+                    "title": context.split('\n')[0] if context else "",
+                    "snippet": context,
+                    "query": f"Gemini grounded: {company_name} {roles}"
+                }
+
+    return profiles
+
+
 def search_linkedin_contacts_with_tavily(company_name):
     """
-    Use Tavily API + Gemini to find and format LinkedIn contacts.
+    Hybrid multi-pass search for LinkedIn contacts using Tavily and Gemini grounded search.
 
-    Two-pass approach:
-    1. Pass 1: Tavily searches LinkedIn for profile URLs (10-15 targeted queries)
-    2. Pass 2: Gemini formats the raw results into structured contact entries
+    Pass 1 (Tavily): C-suite and senior marketing leadership
+    Pass 2 (Gemini, if < 10 contacts): Directors and specialists
+    Pass 3 (Gemini, always): Marketing Ops and RevOps
+    Pass 4 (Gemini, if < 10 contacts): Additional executives
 
-    Returns the same plain text format as the original Gemini-only function.
-    Falls back to Gemini Google Search if Tavily fails or returns few results.
+    Falls back to full Gemini Google Search if < 3 valid profiles after all passes.
+    Final Gemini formatting step produces the structured plain text output.
     """
     config = get_config()
 
@@ -411,79 +591,85 @@ def search_linkedin_contacts_with_tavily(company_name):
         print("  [Tavily] Not available, falling back to Gemini Google Search...")
         return search_linkedin_contacts_with_gemini(company_name)
 
-    print(f"  [Tavily] Searching for LinkedIn contacts at {company_name}...")
+    print(f"  [Hybrid Search] Starting multi-pass contact search for {company_name}...")
 
     try:
         tavily = TavilyClient(api_key=config["tavily_api_key"])
+        all_profiles = {}
 
-        # Define targeted search queries for different roles
-        # Each query targets specific executive/marketing roles
-        search_queries = [
+        # Pass 1: Tavily - C-suite and senior marketing (always)
+        print("\n  --- Pass 1/4 (Tavily): C-suite and senior marketing ---")
+        pass1_queries = [
             f'site:linkedin.com/in "{company_name}" CEO',
             f'site:linkedin.com/in "{company_name}" CMO',
             f'site:linkedin.com/in "{company_name}" CRO',
-            f'site:linkedin.com/in "{company_name}" CFO',
-            f'site:linkedin.com/in "{company_name}" COO',
-            f'site:linkedin.com/in "{company_name}" Founder',
             f'site:linkedin.com/in "{company_name}" "VP Marketing"',
+            f'site:linkedin.com/in "{company_name}" "SVP Marketing"',
+            f'site:linkedin.com/in "{company_name}" "Chief Marketing Officer"',
             f'site:linkedin.com/in "{company_name}" "Vice President Marketing"',
-            f'site:linkedin.com/in "{company_name}" "Director Marketing"',
-            f'site:linkedin.com/in "{company_name}" "Demand Generation"',
-            f'site:linkedin.com/in "{company_name}" "ABM"',
-            f'site:linkedin.com/in "{company_name}" "Marketing Operations"',
-            f'site:linkedin.com/in "{company_name}" "Digital Marketing"',
-            f'site:linkedin.com/in "{company_name}" "Growth Marketing"',
         ]
+        pass1 = _tavily_linkedin_search(tavily, pass1_queries, company_name)
+        all_profiles.update(pass1)
+        print(f"  [Pass 1] {len(pass1)} new profiles ({len(all_profiles)} total)")
 
-        # Collect all unique LinkedIn profiles from searches
-        all_profiles = {}  # URL -> profile data (deduplication)
+        # Pass 2: Gemini grounded - Directors and specialists (if < 10 contacts)
+        if len(all_profiles) < 10:
+            print("\n  --- Pass 2/4 (Gemini grounded): Directors and specialists ---")
+            pass2_roles = [
+                "Director Marketing", "ABM", "Account-Based Marketing",
+                "Demand Gen", "Growth Marketing", "Digital Marketing",
+                "Product Marketing",
+            ]
+            pass2 = _gemini_grounded_linkedin_search(pass2_roles, company_name)
+            for url, data in pass2.items():
+                if url not in all_profiles:
+                    all_profiles[url] = data
+            print(f"  [Pass 2] {len(pass2)} new profiles ({len(all_profiles)} total)")
+        else:
+            print("\n  --- Pass 2/4 (Gemini grounded): Skipped (>=10 contacts) ---")
 
-        for i, query in enumerate(search_queries):
-            try:
-                print(f"    [{i+1}/{len(search_queries)}] Searching: {query[:60]}...")
+        # Pass 3: Gemini grounded - Marketing Ops and RevOps (always)
+        print("\n  --- Pass 3/4 (Gemini grounded): Marketing Ops and RevOps ---")
+        pass3_roles = [
+            "Marketing Operations", "Marketing Ops", "MOPs",
+            "Revenue Operations Marketing", "Marketing Technology",
+        ]
+        pass3 = _gemini_grounded_linkedin_search(pass3_roles, company_name)
+        for url, data in pass3.items():
+            if url not in all_profiles:
+                all_profiles[url] = data
+        print(f"  [Pass 3] {len(pass3)} new profiles ({len(all_profiles)} total)")
 
-                response = tavily.search(
-                    query=query,
-                    search_depth="advanced",
-                    include_domains=["linkedin.com"],
-                    max_results=5
-                )
+        # Pass 4: Gemini grounded - Additional executives (if < 10 contacts)
+        if len(all_profiles) < 10:
+            print("\n  --- Pass 4/4 (Gemini grounded): Additional executives ---")
+            pass4_roles = [
+                "CFO", "COO", "President", "Founder",
+                "Head of Growth",
+            ]
+            pass4 = _gemini_grounded_linkedin_search(pass4_roles, company_name)
+            for url, data in pass4.items():
+                if url not in all_profiles:
+                    all_profiles[url] = data
+            print(f"  [Pass 4] {len(pass4)} new profiles ({len(all_profiles)} total)")
+        else:
+            print("\n  --- Pass 4/4 (Gemini grounded): Skipped (>=10 contacts) ---")
 
-                results = response.get("results", [])
-                for result in results:
-                    url = result.get("url", "")
-                    # Only include linkedin.com/in/ profiles (not company pages)
-                    if "linkedin.com/in/" in url and url not in all_profiles:
-                        all_profiles[url] = {
-                            "url": url,
-                            "title": result.get("title", ""),
-                            "snippet": result.get("content", ""),
-                            "query": query
-                        }
+        print(f"\n  [Hybrid Search] {len(all_profiles)} total unique profiles across all passes")
 
-                # Brief pause to avoid rate limiting
-                time.sleep(0.3)
-
-            except Exception as e:
-                print(f"    Warning: Query failed - {e}")
-                continue
-
-        print(f"  [Tavily] Found {len(all_profiles)} unique LinkedIn profiles")
-
-        # Validate and fix URLs before passing to Gemini
+        # Validate and fix URLs
         all_profiles = validate_and_fix_linkedin_urls(all_profiles, company_name)
 
-        # Check if we got enough results after validation
-        if len(all_profiles) < 5:
-            print("  [Tavily] Too few valid results, falling back to Gemini Google Search...")
+        # Fallback: if < 3 valid profiles, use full Gemini Google Search
+        if len(all_profiles) < 3:
+            print("  [Hybrid Search] Too few valid profiles (<3), falling back to full Gemini Google Search...")
             return search_linkedin_contacts_with_gemini(company_name)
 
-        # Pass 2: Use Gemini to format the raw profile data
+        # Final formatting step: Gemini structures the raw data
         print("  [Gemini] Formatting contact information...")
 
-        # Prepare profile data for Gemini
         profiles_text = ""
-        for url, data in list(all_profiles.items())[:25]:  # Limit to 25 profiles
+        for url, data in list(all_profiles.items())[:25]:
             profiles_text += f"""
 URL: {data['url']}
 Title/Name from Search: {data['title']}
@@ -492,7 +678,6 @@ Search Query Used: {data['query']}
 ---
 """
 
-        # Gemini formatting prompt - emphasizes exact output format
         format_prompt = f"""# ROLE
 Act as an Executive Sales Researcher. Your task is to format LinkedIn contact data into a structured list.
 
@@ -533,44 +718,20 @@ Insight: [Brief note from the snippet about their background or expertise]
 
 Now format the contacts:"""
 
-        # Call Gemini API for formatting
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={config['gemini_api_key']}"
+        gateway = LLMGateway(profile="strategic")
+        result = gateway.chat(
+            messages=[{"role": "user", "content": format_prompt}],
+            temperature=0.3,
+            max_tokens=8192,
+        )
 
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "contents": [{"parts": [{"text": format_prompt}]}],
-            "generationConfig": {
-                "maxOutputTokens": 8192,
-                "temperature": 0.3,  # Lower temp for more consistent formatting
-            }
-        }
-
-        response = requests.post(url, headers=headers, json=payload, timeout=120)
-        response.raise_for_status()
-        data = response.json()
-
-        # Extract formatted text
-        candidates = data.get("candidates", [])
-        if candidates:
-            content = candidates[0].get("content", {})
-            parts = content.get("parts", [])
-            result_parts = []
-            for part in parts:
-                if "text" in part:
-                    result_parts.append(part["text"])
-            result = "\n".join(result_parts)
-
-            # Count contacts in result
-            contact_count = result.lower().count("linkedin.com/in/")
-            print(f"  [Tavily+Gemini] Formatted {contact_count} contacts")
-            return result
-
-        print("  [Tavily] Formatting failed, falling back to Gemini Google Search...")
-        return search_linkedin_contacts_with_gemini(company_name)
+        contact_count = result.lower().count("linkedin.com/in/")
+        print(f"  [Hybrid Search] Formatted {contact_count} contacts")
+        return result
 
     except Exception as e:
-        print(f"  [Tavily] Error: {e}")
-        print("  [Tavily] Falling back to Gemini Google Search...")
+        print(f"  [Hybrid Search] Error: {e}")
+        print("  [Hybrid Search] Falling back to Gemini Google Search...")
         return search_linkedin_contacts_with_gemini(company_name)
 
 
@@ -632,11 +793,11 @@ def validate_and_fix_linkedin_urls(profiles, company_name):
             # Close immediately - we only need the status code
             response.close()
 
-            # 200 = valid, 404 = not found, 999 = rate limited
+            # 200 = valid, 404 = not found, 999/403 = rate limited
             if response.status_code == 200:
                 validated_profiles[url] = data
-            elif response.status_code in [404, 999]:
-                print(f"    [x] Invalid URL (HTTP {response.status_code}): {url[:60]}...")
+            elif response.status_code == 404:
+                print(f"    [x] Invalid URL (HTTP 404): {url[:60]}...")
                 fixed_url = find_linkedin_url_via_google(data, company_name)
                 if fixed_url and fixed_url != url:
                     print(f"    [+] Found corrected URL via Google")
@@ -646,8 +807,11 @@ def validate_and_fix_linkedin_urls(profiles, company_name):
                 else:
                     skipped_count += 1
                 time.sleep(0.5)
+            elif response.status_code in [999, 403]:
+                print(f"    [~] Rate-limited (HTTP {response.status_code}), keeping: {url[:60]}...")
+                validated_profiles[url] = data
             else:
-                # Other status codes (403, etc.) - keep the URL
+                # Other status codes - keep the URL
                 validated_profiles[url] = data
 
         except requests.RequestException:
@@ -656,6 +820,55 @@ def validate_and_fix_linkedin_urls(profiles, company_name):
 
     print(f"  [Validation] {len(validated_profiles)} valid URLs ({fixed_count} corrected, {skipped_count} removed)")
     return validated_profiles
+
+
+def extract_and_strip_linkedin_lines(contacts_text):
+    """
+    Extract LinkedIn URLs mapped to contact names and remove "LinkedIn:" lines.
+
+    Scans the contacts text for lines starting with "LinkedIn:" that contain a URL,
+    looks back 1-3 lines to find the associated contact name, builds a {name: url}
+    mapping, and removes the "LinkedIn:" lines from the text.
+
+    Returns:
+        tuple: (cleaned_text, url_mappings) where url_mappings is {name: url}
+    """
+    if not contacts_text:
+        return contacts_text, {}
+
+    lines = contacts_text.split('\n')
+    url_mappings = {}
+    lines_to_remove = set()
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("LinkedIn:"):
+            continue
+        # Extract URL from the line
+        url_match = re.search(r'https?://[^\s]+', stripped)
+        if not url_match:
+            continue
+        url = url_match.group(0)
+
+        # Look back 1-3 lines to find the contact name
+        for j in range(1, 4):
+            if i - j < 0:
+                break
+            potential_name = lines[i - j].strip()
+            if (potential_name and
+                not potential_name.startswith((
+                    "Title:", "LinkedIn:", "Tenure:", "Location:",
+                    "Insight:", "CHAMPION",
+                ))):
+                url_mappings[potential_name] = url
+                break
+
+        lines_to_remove.add(i)
+
+    cleaned_lines = [line for idx, line in enumerate(lines) if idx not in lines_to_remove]
+    cleaned_text = '\n'.join(cleaned_lines)
+
+    return cleaned_text, url_mappings
 
 
 def find_linkedin_url_via_google(profile_data, company_name):
@@ -833,36 +1046,16 @@ Summary: [2-3 sentence summary of the key points]
 
 Now format the news items:"""
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={config['gemini_api_key']}"
+        gateway = LLMGateway(profile="strategic")
+        result = gateway.chat(
+            messages=[{"role": "user", "content": format_prompt}],
+            temperature=0.3,
+            max_tokens=4096,
+        )
 
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "contents": [{"parts": [{"text": format_prompt}]}],
-            "generationConfig": {
-                "maxOutputTokens": 4096,
-                "temperature": 0.3,
-            }
-        }
-
-        response = requests.post(url, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
-        data = response.json()
-
-        candidates = data.get("candidates", [])
-        if candidates:
-            content = candidates[0].get("content", {})
-            parts = content.get("parts", [])
-            result_parts = []
-            for part in parts:
-                if "text" in part:
-                    result_parts.append(part["text"])
-            result = "\n".join(result_parts)
-
-            news_count = result.count("Source:")
-            print(f"  [News] Formatted {news_count} news items")
-            return result
-
-        return "Error formatting news. Raw data was collected but formatting failed."
+        news_count = result.count("Source:")
+        print(f"  [News] Formatted {news_count} news items")
+        return result
 
     except Exception as e:
         print(f"  [News] Error: {e}")
@@ -874,52 +1067,56 @@ Now format the news items:"""
 # =============================================================================
 
 def call_gemini_api(prompt, max_tokens=16384, use_search=False):
-    """Call Gemini API for text generation with optional Google Search grounding."""
+    """Call Gemini API for text generation with optional Google Search grounding.
+
+    Standard calls route through LLMGateway (OpenAI-compatible).
+    Grounded search calls use the native Gemini REST API since
+    google_search is a vendor-specific tool not in the OpenAI spec.
+    """
+    if use_search:
+        return _call_gemini_grounded(prompt, max_tokens)
+
+    try:
+        gateway = LLMGateway(profile="strategic")
+        return gateway.chat(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+            max_tokens=max_tokens,
+        )
+    except Exception as e:
+        print(f"  [Gemini/Gateway] Error: {e}")
+        return ""
+
+
+def _call_gemini_grounded(prompt, max_tokens=16384):
+    """Native Gemini REST call for google_search grounding (not OpenAI-compatible)."""
     config = get_config()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={config['gemini_api_key']}"
 
-    headers = {
-        "Content-Type": "application/json",
-    }
-
     payload = {
-        "contents": [{
-            "parts": [{
-                "text": prompt
-            }]
-        }],
+        "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "maxOutputTokens": max_tokens,
-            "temperature": 0.4,  # Lower temperature for more factual output
-        }
+            "temperature": 0.4,
+        },
+        "tools": [{"google_search": {}}],
     }
 
-    # Add Google Search grounding if requested
-    if use_search:
-        payload["tools"] = [{"google_search": {}}]
-
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=180)
+        response = requests.post(
+            url, headers={"Content-Type": "application/json"}, json=payload, timeout=180
+        )
         response.raise_for_status()
         data = response.json()
 
-        # Extract generated text from all parts
         candidates = data.get("candidates", [])
         if candidates:
-            content = candidates[0].get("content", {})
-            parts = content.get("parts", [])
-
-            # Combine text from all parts (grounded responses may have multiple)
-            result_parts = []
-            for part in parts:
-                if "text" in part:
-                    result_parts.append(part["text"])
-
-            return "\n".join(result_parts)
+            parts = candidates[0].get("content", {}).get("parts", [])
+            return "\n".join(p["text"] for p in parts if "text" in p)
 
         return ""
     except Exception as e:
-        print(f"  [Gemini] Error: {e}")
+        print(f"  [Gemini/Grounded] Error: {e}")
         return ""
 
 
@@ -1195,7 +1392,7 @@ def get_google_credentials():
     return creds
 
 
-def apply_text_formatting(docs_service, doc_id, full_text):
+def apply_text_formatting(docs_service, doc_id, full_text, url_mappings=None):
     """Apply bold, italic, and hyperlink formatting to the document text."""
     format_requests = []
 
@@ -1217,8 +1414,8 @@ def apply_text_formatting(docs_service, doc_id, full_text):
         "Product Overview:",
         "Product Differentiation:",
         # Contacts section
+        "CHAMPION",
         "Title:",
-        "LinkedIn:",
         "Tenure:",
         "Location:",
         "Insight:",
@@ -1273,58 +1470,39 @@ def apply_text_formatting(docs_service, doc_id, full_text):
                 }
             })
 
-    # Find LinkedIn URLs and create hyperlinks for contact names
-    # Pattern: "Name\nTitle:" preceded by a blank line, with LinkedIn URL following
-    lines = full_text.split('\n')
-    current_pos = 0
+    # Apply hyperlinks to contact names using pre-extracted url_mappings
+    # Scope search to the Contacts section to avoid matching names in Company Research
+    contacts_section_start = full_text.find("Contacts\n")
+    if contacts_section_start == -1:
+        contacts_section_start = 0
 
-    for i, line in enumerate(lines):
-        line_start = current_pos
-        line_end = current_pos + len(line)
-
-        # Check if this line starts with "LinkedIn: http"
-        if line.strip().startswith("LinkedIn:") and "linkedin.com" in line:
-            # Extract the URL
-            url_start = line.find("http")
-            if url_start != -1:
-                url = line[url_start:].strip()
-
-                # Look back to find the contact name (should be 1-3 lines before)
-                for j in range(1, 4):
-                    if i - j >= 0:
-                        potential_name = lines[i - j].strip()
-                        # Name line should not start with common labels and should not be empty
-                        if (potential_name and
-                            not potential_name.startswith(("Title:", "LinkedIn:", "Tenure:", "Location:", "Insight:", "CRM", "Marketing", "ABM", "Sales", "Analytics", "Event", "Other", "Conversational", "CMS"))):
-                            # This is likely the name - create hyperlink
-                            name_line_start = sum(len(lines[k]) + 1 for k in range(i - j))
-                            name_line_end = name_line_start + len(potential_name)
-
-                            format_requests.append({
-                                "updateTextStyle": {
-                                    "range": {
-                                        "startIndex": name_line_start + 1,
-                                        "endIndex": name_line_end + 1
-                                    },
-                                    "textStyle": {
-                                        "link": {"url": url},
-                                        "foregroundColor": {
-                                            "color": {
-                                                "rgbColor": {"blue": 0.8, "green": 0.2, "red": 0.1}
-                                            }
-                                        }
-                                    },
-                                    "fields": "link,foregroundColor"
-                                }
-                            })
-                            break
-
-        current_pos = line_end + 1  # +1 for newline
+    if url_mappings:
+        for name, url in url_mappings.items():
+            pos = full_text.find(name, contacts_section_start)
+            if pos == -1:
+                continue
+            format_requests.append({
+                "updateTextStyle": {
+                    "range": {
+                        "startIndex": pos + 1,
+                        "endIndex": pos + 1 + len(name)
+                    },
+                    "textStyle": {
+                        "link": {"url": url},
+                        "foregroundColor": {
+                            "color": {
+                                "rgbColor": {"blue": 0.8, "green": 0.2, "red": 0.1}
+                            }
+                        }
+                    },
+                    "fields": "link,foregroundColor"
+                }
+            })
 
     return format_requests
 
 
-def create_google_doc(company_name, company_research, techstack, contacts, news_and_activity=""):
+def create_google_doc(company_name, company_research, techstack, contacts, news_and_activity="", url_mappings=None):
     """Create a Google Doc with the research content."""
     print("\n[Step 6/6] Creating Google Doc...")
 
@@ -1429,7 +1607,7 @@ def create_google_doc(company_name, company_research, techstack, contacts, news_
 
     # Third pass: apply text formatting (bold labels, hyperlinks, subsection headers)
     try:
-        text_format_requests = apply_text_formatting(docs_service, doc_id, full_text)
+        text_format_requests = apply_text_formatting(docs_service, doc_id, full_text, url_mappings=url_mappings)
         if text_format_requests:
             # Process in batches to avoid API limits
             batch_size = 50
@@ -1454,19 +1632,23 @@ def create_google_doc(company_name, company_research, techstack, contacts, news_
 
 def main():
     """Main function to orchestrate deal research generation."""
-    if len(sys.argv) != 3:
-        print("Usage: python deal_research.py \"Company Name\" \"domain.com\"")
+    if len(sys.argv) < 3 or len(sys.argv) > 4:
+        print("Usage: python deal_research.py \"Company Name\" \"domain.com\" [\"Champion Name\"]")
         print("Example: python deal_research.py \"Asana\" \"asana.com\"")
+        print("Example: python deal_research.py \"iManage\" \"imanage.com\" \"Rajiv Chidambaram\"")
         sys.exit(1)
 
     company_name = sys.argv[1]
     domain = sys.argv[2]
+    champion_name = sys.argv[3] if len(sys.argv) == 4 else None
 
     print(f"\n{'='*60}")
     print(f"Deal Research Generator")
     print(f"{'='*60}")
     print(f"Company: {company_name}")
     print(f"Domain: {domain}")
+    if champion_name:
+        print(f"Champion: {champion_name}")
     print(f"{'='*60}\n")
 
     # Step 1: Fetch Apollo data
@@ -1507,6 +1689,16 @@ def main():
     if not contacts:
         contacts = "Error finding contacts. Please add manually."
 
+    # Champion search: find the champion, deduplicate, prepend to contacts
+    if champion_name:
+        champion_text, champion_url = search_champion_contact(champion_name, company_name)
+        if champion_text:
+            contacts = deduplicate_champion_from_contacts(contacts, champion_url, champion_name)
+            contacts = f"CHAMPION\n{champion_text}\n\n{contacts}"
+
+    # Extract LinkedIn URLs and remove "LinkedIn:" lines from contacts text
+    contacts, url_mappings = extract_and_strip_linkedin_lines(contacts)
+
     # Step 5: Gather recent news and activity using Tavily
     print("\n[Step 5/6] Gathering recent news and activity...")
     news_and_activity = generate_news_and_activity(company_name, domain)
@@ -1514,7 +1706,7 @@ def main():
         news_and_activity = "Error gathering news. Please add manually."
 
     # Step 6: Create Google Doc
-    doc_url = create_google_doc(company_name, company_research, techstack, contacts, news_and_activity)
+    doc_url = create_google_doc(company_name, company_research, techstack, contacts, news_and_activity, url_mappings=url_mappings)
 
     # Summary
     print(f"\n{'='*60}")
