@@ -1689,12 +1689,32 @@ def main():
     if not contacts:
         contacts = "Error finding contacts. Please add manually."
 
-    # Champion search: find the champion, deduplicate, prepend to contacts
+    # Champion search: find the champion, deduplicate, prepend to contacts.
+    # The champion is ALWAYS placed at the top of the Contacts section,
+    # even if the LinkedIn search doesn't find a profile URL.
     if champion_name:
         champion_text, champion_url = search_champion_contact(champion_name, company_name)
         if champion_text:
+            # Inject champion insight if not already present
+            if "Insight:" not in champion_text:
+                champion_text += f"\nInsight: Deal champion for this opportunity"
+            else:
+                # Append champion note to existing insight
+                champion_text = champion_text.replace(
+                    "Insight:", "Insight: Deal champion for this opportunity."
+                )
             contacts = deduplicate_champion_from_contacts(contacts, champion_url, champion_name)
             contacts = f"CHAMPION\n{champion_text}\n\n{contacts}"
+        else:
+            # LinkedIn search failed -- still add the champion as a placeholder
+            contacts = deduplicate_champion_from_contacts(contacts, None, champion_name)
+            champion_placeholder = (
+                f"{champion_name}\n"
+                f"Title: Verify on profile\n"
+                f"LinkedIn: Search manually\n"
+                f"Insight: Deal champion for this opportunity"
+            )
+            contacts = f"CHAMPION\n{champion_placeholder}\n\n{contacts}"
 
     # Extract LinkedIn URLs and remove "LinkedIn:" lines from contacts text
     contacts, url_mappings = extract_and_strip_linkedin_lines(contacts)
