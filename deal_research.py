@@ -572,17 +572,43 @@ Only include people who currently work at {company_name}. Include the actual lin
     return profiles
 
 
+def _merge_into_bucket(bucket, new_profiles, seen_urls):
+    """
+    Add new profiles to a bucket dict, skipping any URL already in seen_urls.
+
+    Args:
+        bucket: dict of {url: profile_data} to merge into
+        new_profiles: dict of {url: profile_data} from a search pass
+        seen_urls: set of URLs seen across all buckets (updated in place)
+
+    Returns:
+        int: number of new profiles actually added
+    """
+    added = 0
+    for url, data in new_profiles.items():
+        if url not in seen_urls:
+            bucket[url] = data
+            seen_urls.add(url)
+            added += 1
+    return added
+
+
 def search_linkedin_contacts_with_tavily(company_name):
     """
-    Hybrid multi-pass search for LinkedIn contacts using Tavily and Gemini grounded search.
+    Two-bucket multi-pass search for LinkedIn contacts.
 
-    Pass 1 (Tavily): C-suite and senior marketing leadership
-    Pass 2 (Gemini, if < 10 contacts): Directors and specialists
-    Pass 3 (Gemini, always): Marketing Ops and RevOps
-    Pass 4 (Gemini, if < 10 contacts): Additional executives
+    Phase 1 - Marketing (primary, target 5-10):
+      Pass 1 (Tavily): CMO, VP/SVP Marketing, ABM, Demand Gen, Growth Marketing
+      Pass 2 (Tavily): Marketing Ops, MOPs, MarTech, RevOps
+      Pass 3 (Gemini grounded, if < 5 marketing): Director/Product/Field/Content/Digital Marketing
 
-    Falls back to full Gemini Google Search if < 3 valid profiles after all passes.
-    Final Gemini formatting step produces the structured plain text output.
+    Phase 2 - Leadership (secondary, target 5):
+      Pass 4 (Tavily): CEO, CRO, Founder, President
+      Pass 5 (Gemini grounded, if < 5 leadership): CFO, COO, CTO, Co-Founder
+      Pass 6 (Gemini grounded, if < 5 leadership): VP Sales/Revenue, Director Sales/Revenue
+
+    Falls back to full Gemini Google Search if < 3 total valid profiles.
+    Final Gemini formatting outputs marketing first (including marketing leadership), then company leadership.
     """
     config = get_config()
 
@@ -591,86 +617,135 @@ def search_linkedin_contacts_with_tavily(company_name):
         print("  [Tavily] Not available, falling back to Gemini Google Search...")
         return search_linkedin_contacts_with_gemini(company_name)
 
-    print(f"  [Hybrid Search] Starting multi-pass contact search for {company_name}...")
+    print(f"  [Two-Bucket Search] Starting contact search for {company_name}...")
 
     try:
         tavily = TavilyClient(api_key=config["tavily_api_key"])
-        all_profiles = {}
+        marketing_profiles = {}
+        leadership_profiles = {}
+        seen_urls = set()
 
-        # Pass 1: Tavily - C-suite and senior marketing (always)
-        print("\n  --- Pass 1/4 (Tavily): C-suite and senior marketing ---")
+        # ── Phase 1: Marketing (primary, target 5-10) ───────────────────
+
+        # Pass 1 (Tavily): Marketing leadership + ABM/Demand Gen
+        print("\n  === Phase 1: Marketing (primary, target 5-10) ===")
+        print("\n  --- Pass 1/6 (Tavily): Marketing leadership, ABM, Demand Gen ---")
         pass1_queries = [
-            f'site:linkedin.com/in "{company_name}" CEO',
             f'site:linkedin.com/in "{company_name}" CMO',
-            f'site:linkedin.com/in "{company_name}" CRO',
+            f'site:linkedin.com/in "{company_name}" "Chief Marketing Officer"',
             f'site:linkedin.com/in "{company_name}" "VP Marketing"',
             f'site:linkedin.com/in "{company_name}" "SVP Marketing"',
-            f'site:linkedin.com/in "{company_name}" "Chief Marketing Officer"',
-            f'site:linkedin.com/in "{company_name}" "Vice President Marketing"',
+            f'site:linkedin.com/in "{company_name}" ABM',
+            f'site:linkedin.com/in "{company_name}" "Account-Based Marketing"',
+            f'site:linkedin.com/in "{company_name}" "Demand Gen"',
+            f'site:linkedin.com/in "{company_name}" "Demand Generation"',
+            f'site:linkedin.com/in "{company_name}" "Growth Marketing"',
         ]
         pass1 = _tavily_linkedin_search(tavily, pass1_queries, company_name)
-        all_profiles.update(pass1)
-        print(f"  [Pass 1] {len(pass1)} new profiles ({len(all_profiles)} total)")
+        added = _merge_into_bucket(marketing_profiles, pass1, seen_urls)
+        print(f"  [Pass 1] {added} new marketing profiles ({len(marketing_profiles)} marketing total)")
 
-        # Pass 2: Gemini grounded - Directors and specialists (if < 10 contacts)
-        if len(all_profiles) < 10:
-            print("\n  --- Pass 2/4 (Gemini grounded): Directors and specialists ---")
-            pass2_roles = [
-                "Director Marketing", "ABM", "Account-Based Marketing",
-                "Demand Gen", "Growth Marketing", "Digital Marketing",
-                "Product Marketing",
-            ]
-            pass2 = _gemini_grounded_linkedin_search(pass2_roles, company_name)
-            for url, data in pass2.items():
-                if url not in all_profiles:
-                    all_profiles[url] = data
-            print(f"  [Pass 2] {len(pass2)} new profiles ({len(all_profiles)} total)")
-        else:
-            print("\n  --- Pass 2/4 (Gemini grounded): Skipped (>=10 contacts) ---")
-
-        # Pass 3: Gemini grounded - Marketing Ops and RevOps (always)
-        print("\n  --- Pass 3/4 (Gemini grounded): Marketing Ops and RevOps ---")
-        pass3_roles = [
-            "Marketing Operations", "Marketing Ops", "MOPs",
-            "Revenue Operations Marketing", "Marketing Technology",
+        # Pass 2 (Tavily): Marketing Ops, MOPs, MarTech, RevOps
+        print("\n  --- Pass 2/6 (Tavily): Marketing Ops and MarTech ---")
+        pass2_queries = [
+            f'site:linkedin.com/in "{company_name}" "Marketing Operations"',
+            f'site:linkedin.com/in "{company_name}" "Marketing Ops"',
+            f'site:linkedin.com/in "{company_name}" MOPs',
+            f'site:linkedin.com/in "{company_name}" "Marketing Technology"',
+            f'site:linkedin.com/in "{company_name}" "Revenue Operations"',
         ]
-        pass3 = _gemini_grounded_linkedin_search(pass3_roles, company_name)
-        for url, data in pass3.items():
-            if url not in all_profiles:
-                all_profiles[url] = data
-        print(f"  [Pass 3] {len(pass3)} new profiles ({len(all_profiles)} total)")
+        pass2 = _tavily_linkedin_search(tavily, pass2_queries, company_name)
+        added = _merge_into_bucket(marketing_profiles, pass2, seen_urls)
+        print(f"  [Pass 2] {added} new marketing profiles ({len(marketing_profiles)} marketing total)")
 
-        # Pass 4: Gemini grounded - Additional executives (if < 10 contacts)
-        if len(all_profiles) < 10:
-            print("\n  --- Pass 4/4 (Gemini grounded): Additional executives ---")
-            pass4_roles = [
-                "CFO", "COO", "President", "Founder",
-                "Head of Growth",
+        # Pass 3 (Gemini grounded, if < 5 marketing): broader marketing titles
+        if len(marketing_profiles) < 5:
+            print("\n  --- Pass 3/6 (Gemini grounded): Broader marketing titles ---")
+            pass3_roles = [
+                "Director Marketing", "Digital Marketing",
+                "Product Marketing", "Field Marketing", "Content Marketing",
             ]
-            pass4 = _gemini_grounded_linkedin_search(pass4_roles, company_name)
-            for url, data in pass4.items():
-                if url not in all_profiles:
-                    all_profiles[url] = data
-            print(f"  [Pass 4] {len(pass4)} new profiles ({len(all_profiles)} total)")
+            pass3 = _gemini_grounded_linkedin_search(pass3_roles, company_name)
+            added = _merge_into_bucket(marketing_profiles, pass3, seen_urls)
+            print(f"  [Pass 3] {added} new marketing profiles ({len(marketing_profiles)} marketing total)")
         else:
-            print("\n  --- Pass 4/4 (Gemini grounded): Skipped (>=10 contacts) ---")
+            print(f"\n  --- Pass 3/6 (Gemini grounded): Skipped ({len(marketing_profiles)} marketing >= 5) ---")
 
-        print(f"\n  [Hybrid Search] {len(all_profiles)} total unique profiles across all passes")
+        print(f"\n  [Phase 1 done] {len(marketing_profiles)} marketing contacts found")
 
-        # Validate and fix URLs
-        all_profiles = validate_and_fix_linkedin_urls(all_profiles, company_name)
+        # ── Phase 2: Leadership (secondary, target 5) ─────────────────
 
-        # Fallback: if < 3 valid profiles, use full Gemini Google Search
-        if len(all_profiles) < 3:
-            print("  [Hybrid Search] Too few valid profiles (<3), falling back to full Gemini Google Search...")
+        # Pass 4 (Tavily): Founders and C-suite
+        print("\n  === Phase 2: Leadership (secondary, target 5) ===")
+        print("\n  --- Pass 4/6 (Tavily): Founders and C-suite ---")
+        pass4_queries = [
+            f'site:linkedin.com/in "{company_name}" CEO',
+            f'site:linkedin.com/in "{company_name}" CRO',
+            f'site:linkedin.com/in "{company_name}" Founder',
+            f'site:linkedin.com/in "{company_name}" President',
+        ]
+        pass4 = _tavily_linkedin_search(tavily, pass4_queries, company_name)
+        added = _merge_into_bucket(leadership_profiles, pass4, seen_urls)
+        print(f"  [Pass 4] {added} new leadership profiles ({len(leadership_profiles)} leadership total)")
+
+        # Pass 5 (Gemini grounded, if < 5 leadership): more C-suite
+        if len(leadership_profiles) < 5:
+            print("\n  --- Pass 5/6 (Gemini grounded): Additional C-suite ---")
+            pass5_roles = [
+                "CFO", "COO", "CTO", "Co-Founder",
+            ]
+            pass5 = _gemini_grounded_linkedin_search(pass5_roles, company_name)
+            added = _merge_into_bucket(leadership_profiles, pass5, seen_urls)
+            print(f"  [Pass 5] {added} new leadership profiles ({len(leadership_profiles)} leadership total)")
+        else:
+            print(f"\n  --- Pass 5/6 (Gemini grounded): Skipped ({len(leadership_profiles)} leadership >= 5) ---")
+
+        # Pass 6 (Gemini grounded, if < 5 leadership): sales/revenue leaders
+        if len(leadership_profiles) < 5:
+            print("\n  --- Pass 6/6 (Gemini grounded): Sales and Revenue leaders ---")
+            pass6_roles = [
+                "VP Sales", "VP Revenue",
+                "Director Sales", "Director Revenue",
+            ]
+            pass6 = _gemini_grounded_linkedin_search(pass6_roles, company_name)
+            added = _merge_into_bucket(leadership_profiles, pass6, seen_urls)
+            print(f"  [Pass 6] {added} new leadership profiles ({len(leadership_profiles)} leadership total)")
+        else:
+            print(f"\n  --- Pass 6/6 (Gemini grounded): Skipped ({len(leadership_profiles)} leadership >= 5) ---")
+
+        total = len(marketing_profiles) + len(leadership_profiles)
+        print(f"\n  [Two-Bucket Search] {total} total unique profiles "
+              f"({len(marketing_profiles)} marketing, {len(leadership_profiles)} leadership)")
+
+        # Validate URLs per bucket so bucket identity survives
+        marketing_profiles = validate_and_fix_linkedin_urls(marketing_profiles, company_name)
+        leadership_profiles = validate_and_fix_linkedin_urls(leadership_profiles, company_name)
+
+        total_valid = len(marketing_profiles) + len(leadership_profiles)
+        print(f"  [Two-Bucket Search] {total_valid} valid profiles after URL check "
+              f"({len(marketing_profiles)} marketing, {len(leadership_profiles)} leadership)")
+
+        # Fallback: if < 3 total valid profiles, use full Gemini Google Search
+        if total_valid < 3:
+            print("  [Two-Bucket Search] Too few valid profiles (<3), falling back to full Gemini Google Search...")
             return search_linkedin_contacts_with_gemini(company_name)
 
-        # Final formatting step: Gemini structures the raw data
+        # Build profiles_text with bucket tags
         print("  [Gemini] Formatting contact information...")
 
         profiles_text = ""
-        for url, data in list(all_profiles.items())[:25]:
+        for url, data in list(marketing_profiles.items())[:15]:
             profiles_text += f"""
+Bucket: MARKETING
+URL: {data['url']}
+Title/Name from Search: {data['title']}
+Snippet: {data['snippet']}
+Search Query Used: {data['query']}
+---
+"""
+        for url, data in list(leadership_profiles.items())[:10]:
+            profiles_text += f"""
+Bucket: LEADERSHIP
 URL: {data['url']}
 Title/Name from Search: {data['title']}
 Snippet: {data['snippet']}
@@ -679,19 +754,29 @@ Search Query Used: {data['query']}
 """
 
         format_prompt = f"""# ROLE
-Act as an Executive Sales Researcher. Your task is to format LinkedIn contact data into a structured list.
+Act as an Executive Sales Researcher. Your task is to format LinkedIn contact data into a structured list with two labeled sections.
 
 # RAW DATA
-Below are LinkedIn profile URLs and snippets found for people at {company_name}:
+Below are LinkedIn profile URLs and snippets found for people at {company_name}. Each profile has a Bucket tag (MARKETING or LEADERSHIP):
 
 {profiles_text}
 
 # TASK
 Using ONLY the data provided above, format each person into the contact format below.
-Focus on these roles in priority order:
-1. C-Suite (CEO, CMO, CRO, CFO, COO) and Founders
-2. VPs and Directors in Marketing, Sales, or Revenue
-3. Anyone with ABM, Demand Generation, or Marketing Operations in their title
+Output TWO sections in this exact order:
+
+Section 1: Marketing (all profiles tagged MARKETING)
+  - Includes marketing leadership (CMO, VP Marketing, SVP Marketing) and practitioners
+  - ABM, Demand Gen, Marketing Ops, MOPs, MarTech, RevOps, Growth Marketing, Product Marketing, etc.
+  - Order by seniority within this section (CMO/VP first, then Directors, then Managers/ICs)
+
+Then print this exact divider on its own line:
+--- LEADERSHIP ---
+
+Section 2: Leadership (all profiles tagged LEADERSHIP)
+  - Founders, CEO, CRO, CFO, COO, CTO, President
+  - VPs and Directors in Sales or Revenue
+  - Order by seniority within this section (Founders/CEO first)
 
 # CRITICAL FORMATTING INSTRUCTIONS
 This output will be pasted into Google Docs which does NOT render markdown.
@@ -702,7 +787,6 @@ Use this EXACT plain text format for each contact:
 CONTACT NAME
 Title: [Their Current Title at {company_name}]
 LinkedIn: [Full URL exactly as provided]
-Tenure: [Time at company if mentioned in snippet, otherwise "Verify on profile"]
 Location: [City, State/Country if mentioned, otherwise "Verify on profile"]
 Insight: [Brief note from the snippet about their background or expertise]
 
@@ -713,8 +797,9 @@ Insight: [Brief note from the snippet about their background or expertise]
 2. Use the exact LinkedIn URL provided - do not modify it
 3. Extract name from the search title (usually "Name - Title | LinkedIn")
 4. If information is not available in the snippet, write "Verify on profile"
-5. Order contacts by seniority (C-Suite first, then VPs, then Directors, then others)
-6. Aim to include 10-20 contacts if data is available
+5. Marketing Practitioners section MUST come before the --- LEADERSHIP --- divider
+6. Aim to include all profiles provided (up to 25 total)
+7. Respect the Bucket tag: do not move MARKETING profiles into the Leadership section or vice versa
 
 Now format the contacts:"""
 
@@ -726,12 +811,13 @@ Now format the contacts:"""
         )
 
         contact_count = result.lower().count("linkedin.com/in/")
-        print(f"  [Hybrid Search] Formatted {contact_count} contacts")
+        print(f"  [Two-Bucket Search] Formatted {contact_count} contacts "
+              f"({len(marketing_profiles)} marketing, {len(leadership_profiles)} leadership)")
         return result
 
     except Exception as e:
-        print(f"  [Hybrid Search] Error: {e}")
-        print("  [Hybrid Search] Falling back to Gemini Google Search...")
+        print(f"  [Two-Bucket Search] Error: {e}")
+        print("  [Two-Bucket Search] Falling back to Gemini Google Search...")
         return search_linkedin_contacts_with_gemini(company_name)
 
 
