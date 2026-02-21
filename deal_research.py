@@ -27,15 +27,16 @@ import sys
 import time
 import webbrowser
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import quote_plus
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env")
 
 import requests
 from bs4 import BeautifulSoup
-from google.auth.transport.requests import Request
+from google_workspace.auth import build_service
 from llm_gateway import LLMGateway
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
 
 # Tavily import - optional, will fail gracefully if not installed
 try:
@@ -77,12 +78,6 @@ def load_config():
         "gemini_api_key": os.environ["GEMINI_API_KEY"],
         "tavily_api_key": tavily_key,
         "google_drive_folder_id": os.environ["GOOGLE_DRIVE_FOLDER_ID"],
-        "google_credentials_path": os.path.expanduser(
-            os.environ.get("GOOGLE_CREDENTIALS_PATH", "~/.config/deal-research/credentials.json")
-        ),
-        "google_token_path": os.path.expanduser(
-            os.environ.get("GOOGLE_TOKEN_PATH", "~/.config/deal-research/token.json")
-        ),
     }
 
 # Global config - loaded at runtime
@@ -95,11 +90,6 @@ def get_config():
         CONFIG = load_config()
     return CONFIG
 
-# Google API scopes
-SCOPES = [
-    "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/drive",
-]
 
 # Tech stack patterns to detect on websites
 TECH_PATTERNS = {
@@ -1444,40 +1434,6 @@ Generate the formatted contacts list now:"""
 # GOOGLE DOCS API INTEGRATION
 # =============================================================================
 
-def get_google_credentials():
-    """Get or refresh Google API credentials using OAuth."""
-    creds = None
-    config = get_config()
-    token_path = config["google_token_path"]
-    credentials_path = config["google_credentials_path"]
-
-    # Load existing token if available
-    if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-
-    # Refresh or get new credentials if needed
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            print("  [Google] Refreshing access token...")
-            creds.refresh(Request())
-        else:
-            if not os.path.exists(credentials_path):
-                print(f"\n  ERROR: {credentials_path} not found!")
-                print("  Please create credentials.json with your OAuth client configuration.")
-                print("  See setup instructions in the script comments.")
-                return None
-            print("  [Google] Starting OAuth flow...")
-            flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        # Save the token for future use
-        os.makedirs(os.path.dirname(token_path), exist_ok=True)
-        with open(token_path, "w") as token:
-            token.write(creds.to_json())
-
-    return creds
-
-
 def apply_text_formatting(docs_service, doc_id, full_text, url_mappings=None):
     """Apply bold, italic, and hyperlink formatting to the document text."""
     format_requests = []
@@ -1592,13 +1548,9 @@ def create_google_doc(company_name, company_research, techstack, contacts, news_
     """Create a Google Doc with the research content."""
     print("\n[Step 6/6] Creating Google Doc...")
 
-    creds = get_google_credentials()
-    if not creds:
-        return None
-
     # Build services
-    docs_service = build("docs", "v1", credentials=creds)
-    drive_service = build("drive", "v3", credentials=creds)
+    docs_service = build_service("docs", "v1")
+    drive_service = build_service("drive", "v3")
 
     # Create document title
     current_date = datetime.now().strftime("%B %Y")
