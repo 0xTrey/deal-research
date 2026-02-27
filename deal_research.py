@@ -77,6 +77,7 @@ def load_config():
         "apollo_api_key": os.environ["APOLLO_API_KEY"],
         "gemini_api_key": os.environ["GEMINI_API_KEY"],
         "tavily_api_key": tavily_key,
+        "brave_api_key": os.environ.get("BRAVE_API_KEY"),
         "google_drive_folder_id": os.environ["GOOGLE_DRIVE_FOLDER_ID"],
     }
 
@@ -1165,7 +1166,11 @@ def call_gemini_api(prompt, max_tokens=16384, use_search=False):
 
 
 def _call_gemini_grounded(prompt, max_tokens=16384):
-    """Native Gemini REST call for google_search grounding (not OpenAI-compatible)."""
+    """Native Gemini REST call for google_search grounding (not OpenAI-compatible).
+
+    Retries up to 4 attempts with increasing back-off on rate-limit, server errors,
+    and silent empty-response failures.
+    """
     config = get_config()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={config['gemini_api_key']}"
 
@@ -1178,22 +1183,106 @@ def _call_gemini_grounded(prompt, max_tokens=16384):
         "tools": [{"google_search": {}}],
     }
 
-    try:
-        response = requests.post(
-            url, headers={"Content-Type": "application/json"}, json=payload, timeout=180
-        )
-        response.raise_for_status()
-        data = response.json()
+    waits = [0, 15, 30, 60]  # seconds to wait before each attempt (first is immediate)
+    for attempt, wait in enumerate(waits, start=1):
+        if wait > 0:
+            print(f"  [Gemini/Grounded] Retrying in {wait}s (attempt {attempt}/{len(waits)})...")
+            time.sleep(wait)
 
-        candidates = data.get("candidates", [])
-        if candidates:
+        try:
+            response = requests.post(
+                url, headers={"Content-Type": "application/json"}, json=payload, timeout=180
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            candidates = data.get("candidates", [])
+            if not candidates:
+                print("  [Gemini/Grounded] Warning: empty candidates in response")
+                if attempt < len(waits):
+                    continue
+                return ""
+
             parts = candidates[0].get("content", {}).get("parts", [])
-            return "\n".join(p["text"] for p in parts if "text" in p)
+            text_parts = [p["text"] for p in parts if "text" in p]
+            if not text_parts:
+                finish = candidates[0].get("finishReason", "?")
+                print(f"  [Gemini/Grounded] Warning: no text parts (finishReason={finish})")
+                if attempt < len(waits):
+                    continue
+                return ""
 
-        return ""
+            return "\n".join(text_parts)
+
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response else "?"
+            body = e.response.text[:200] if e.response else ""
+            print(f"  [Gemini/Grounded] HTTP {status} error: {e} — {body}")
+            retriable = status == 429 or (isinstance(status, int) and 500 <= status < 600)
+            if not retriable or attempt >= len(waits):
+                return ""
+        except requests.exceptions.Timeout:
+            print("  [Gemini/Grounded] Timeout after 180s")
+            if attempt >= len(waits):
+                return ""
+        except Exception as e:
+            print(f"  [Gemini/Grounded] Unexpected error: {type(e).__name__}: {e}")
+            return ""
+
+    return ""
+
+
+def _brave_search(query, count=5):
+    """Brave web search. Returns list of {title, url, description} dicts."""
+    config = get_config()
+    brave_api_key = config.get("brave_api_key")
+    if not brave_api_key:
+        return []
+    headers = {"X-Subscription-Token": brave_api_key, "Accept": "application/json"}
+    try:
+        resp = requests.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers=headers,
+            params={"q": query, "count": count},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json().get("web", {}).get("results", [])
     except Exception as e:
-        print(f"  [Gemini/Grounded] Error: {e}")
+        print(f"  [Brave] Search error for '{query[:60]}': {e}")
+        return []
+
+
+def _gather_company_data_brave(company_name, domain):
+    """Run targeted Brave Search queries and return a raw context block for LLM synthesis."""
+    print(f"  [Brave] Gathering context for {company_name}...")
+    queries = [
+        f'"{company_name}" company overview crunchbase',
+        f'"{company_name}" funding history investors',
+        f'"{company_name}" revenue employees valuation site:crunchbase.com OR site:pitchbook.com',
+        f'"{company_name}" news 2025 2026 announcement',
+    ]
+    all_snippets = []
+    seen_urls: set = set()
+    for query in queries:
+        results = _brave_search(query, count=5)
+        for r in results:
+            url = r.get("url", "")
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            snippet = (
+                f"Title: {r.get('title', '')}\n"
+                f"URL: {url}\n"
+                f"Description: {r.get('description', '')}"
+            )
+            all_snippets.append(snippet)
+
+    if not all_snippets:
         return ""
+
+    print(f"  [Brave] Gathered {len(all_snippets)} snippets")
+    return "\n\n---\n\n".join(all_snippets)
 
 
 def generate_company_research(apollo_data, company_name):
@@ -1295,8 +1384,40 @@ If the company is private and revenue is not disclosed, look for "proxies" such 
 
 Now generate the complete report for {company_name}:"""
 
-    # Use Google Search grounding to get real-time data
-    return call_gemini_api(prompt, use_search=True)
+    # Primary: Gemini with Google Search grounding
+    result = call_gemini_api(prompt, use_search=True)
+    if result:
+        return result
+
+    # Fallback: Brave Search + LLMGateway (non-grounded, different provider/path)
+    print("  [Company Research] Gemini grounded returned empty — trying Brave Search fallback...")
+    domain = apollo_data.get("domain", "") if apollo_data else ""
+    context = _gather_company_data_brave(company_name, domain)
+    if not context:
+        print("  [Company Research] Brave fallback has no context — giving up")
+        return ""
+
+    fallback_prompt = (
+        "# RAW CONTEXT FROM WEB SEARCH\n\n"
+        + context
+        + "\n\n# TASK\n"
+        + f"Using the context above (and your own knowledge), generate the Company Research report for {company_name}.\n\n"
+        + prompt
+    )
+
+    try:
+        gateway = LLMGateway(profile="strategic")
+        result = gateway.chat(
+            messages=[{"role": "user", "content": fallback_prompt}],
+            temperature=0.4,
+            max_tokens=16384,
+        )
+        if result:
+            print("  [Company Research] Brave fallback succeeded")
+        return result
+    except Exception as e:
+        print(f"  [Company Research] Brave fallback LLM call failed: {e}")
+        return ""
 
 
 def generate_techstack_analysis(apollo_tech, scraped_tech, company_name):
@@ -1772,8 +1893,9 @@ def main():
     print(f"{'='*60}")
     if doc_url:
         print(f"\nGoogle Doc: {doc_url}")
-        print("  Opening in browser...")
-        webbrowser.open(doc_url)
+        if not os.environ.get("SKIP_BROWSER"):
+            print("  Opening in browser...")
+            webbrowser.open(doc_url)
     print(f"\nData collected:")
     print(f"  - Apollo enrichment: {'Success' if apollo_data.get('industry') else 'Partial'}")
     print(f"  - Tech stack detected: {len(scraped_tech)} technologies from website")
