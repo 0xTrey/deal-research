@@ -20,18 +20,28 @@ Requirements:
 - Google Drive folder ID (required)
 """
 
+import argparse
 import json
 import os
 import re
 import sys
 import time
+import uuid
 import webbrowser
-from datetime import datetime
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
+
+GOOGLE_WORKSPACE_PATH = Path(
+    os.environ.get("GOOGLE_WORKSPACE_PATH", str(Path.home() / "Projects" / "google-workspace"))
+).expanduser()
+if GOOGLE_WORKSPACE_PATH.exists():
+    sys.path.insert(0, str(GOOGLE_WORKSPACE_PATH))
 
 import requests
 from bs4 import BeautifulSoup
@@ -57,27 +67,31 @@ def load_config():
     except ImportError:
         pass  # dotenv not installed, rely on system environment variables
 
-    # Support AI_GEMINI_KEY (gateway convention) as fallback for GEMINI_API_KEY
-    if not os.environ.get("GEMINI_API_KEY") and os.environ.get("AI_GEMINI_KEY"):
-        os.environ["GEMINI_API_KEY"] = os.environ["AI_GEMINI_KEY"]
+    # Support workflow aliases for gateway and provider credentials.
+    alias_pairs = [
+        ("GEMINI_API_KEY", "AI_GEMINI_KEY"),
+        ("OPENAI_API_KEY", "AI_OPENAI_KEY"),
+        ("DEEPSEEK_API_KEY", "AI_DEEPSEEK_KEY"),
+    ]
+    for canonical_name, alias_name in alias_pairs:
+        if not os.environ.get(canonical_name) and os.environ.get(alias_name):
+            os.environ[canonical_name] = os.environ[alias_name]
 
-    required = ["APOLLO_API_KEY", "GEMINI_API_KEY", "GOOGLE_DRIVE_FOLDER_ID"]
+    required = ["APOLLO_API_KEY", "GOOGLE_DRIVE_FOLDER_ID"]
     missing = [key for key in required if not os.environ.get(key)]
     if missing:
         print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
         print("Please copy .env.example to .env and fill in your API keys.")
         sys.exit(1)
 
-    # Tavily is optional - will fall back to Gemini if not configured
-    tavily_key = os.environ.get("TAVILY_API_KEY")
-    if not tavily_key:
-        print("  Note: TAVILY_API_KEY not set - will use Gemini for LinkedIn search")
-
     return {
         "apollo_api_key": os.environ["APOLLO_API_KEY"],
-        "gemini_api_key": os.environ["GEMINI_API_KEY"],
-        "tavily_api_key": tavily_key,
+        "gemini_api_key": os.environ.get("GEMINI_API_KEY", ""),
+        "tavily_api_key": os.environ.get("TAVILY_API_KEY"),
         "brave_api_key": os.environ.get("BRAVE_API_KEY"),
+        "perplexity_api_key": os.environ.get("PERPLEXITY_API_KEY"),
+        "openai_api_key": os.environ.get("OPENAI_API_KEY", ""),
+        "deepseek_api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
         "google_drive_folder_id": os.environ["GOOGLE_DRIVE_FOLDER_ID"],
     }
 
@@ -1786,123 +1800,1447 @@ def create_google_doc(company_name, company_research, techstack, contacts, news_
 
 
 # =============================================================================
-# MAIN ORCHESTRATION
+# RELIABILITY REFIT
 # =============================================================================
 
-def main():
-    """Main function to orchestrate deal research generation."""
-    if len(sys.argv) < 3 or len(sys.argv) > 4:
-        print("Usage: python deal_research.py \"Company Name\" \"domain.com\" [\"Champion Name\"]")
-        print("Example: python deal_research.py \"Asana\" \"asana.com\"")
-        print("Example: python deal_research.py \"iManage\" \"imanage.com\" \"Rajiv Chidambaram\"")
-        sys.exit(1)
+SEARCH_PROVIDER_ORDER = ("tavily", "brave", "perplexity")
+SYNTHESIS_PROFILE_ORDER = ("workhorse", "local", "openai")
+REQUIRED_SECTION_NAMES = ("company_research", "techstack", "contacts")
+OPTIONAL_SECTION_NAMES = ("news",)
+JSON_RESULT_PREFIX = "RUN_RESULT_JSON:"
 
-    company_name = sys.argv[1]
-    domain = sys.argv[2]
-    champion_name = sys.argv[3] if len(sys.argv) == 4 else None
+
+@dataclass
+class EvidenceItem:
+    title: str
+    url: str
+    snippet: str
+    query: str
+    provider_name: str
+    surface: str
+    published_date: str = ""
+
+
+@dataclass
+class ProviderFailure:
+    provider_type: str
+    provider_name: str
+    error_class: str
+    error_message: str
+    http_status: int | None = None
+    section: str = ""
+    fallback_hop: int = 0
+
+
+@dataclass
+class SectionResult:
+    name: str
+    status: str
+    content: str = ""
+    raw_evidence: list[dict[str, Any]] = field(default_factory=list)
+    provider_chain: list[str] = field(default_factory=list)
+    provider_failures: list[dict[str, Any]] = field(default_factory=list)
+    url_mappings: dict[str, str] = field(default_factory=dict)
+    notes: str = ""
+
+
+@dataclass
+class ResearchRunResult:
+    run_id: str
+    company_name: str
+    domain: str
+    champion_name: str | None
+    status: str
+    doc_created: bool
+    doc_url: str
+    blocked_reason: str
+    failed_sections: list[str]
+    degraded_sections: list[str]
+    provider_failures: list[dict[str, Any]]
+    sections: dict[str, SectionResult]
+    jsonl_log_path: str
+    created_at: str
+
+
+class JsonlLogger:
+    def __init__(self, run_id: str, company_name: str, domain: str) -> None:
+        configured_path = os.environ.get("DEAL_RESEARCH_JSONL_PATH")
+        if configured_path:
+            self.path = Path(configured_path).expanduser()
+        else:
+            self.path = (
+                Path("~/.local/share/deal-research/logs").expanduser()
+                / f"{run_id}.jsonl"
+            )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.base_fields = {
+            "run_id": run_id,
+            "company_name": company_name,
+            "domain": domain,
+        }
+
+    def log(self, **fields: Any) -> None:
+        payload = {
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            **self.base_fields,
+            **fields,
+        }
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+class ProviderExecutionError(RuntimeError):
+    def __init__(
+        self,
+        provider_type: str,
+        provider_name: str,
+        error_class: str,
+        error_message: str,
+        *,
+        http_status: int | None = None,
+    ) -> None:
+        super().__init__(error_message)
+        self.provider_type = provider_type
+        self.provider_name = provider_name
+        self.error_class = error_class
+        self.error_message = error_message
+        self.http_status = http_status
+
+
+def _classify_error(message: str, http_status: int | None = None) -> str:
+    normalized = message.lower()
+    if http_status in (401, 403) or "unauthorized" in normalized or "forbidden" in normalized:
+        return "auth"
+    if http_status == 429 or any(token in normalized for token in ("quota", "rate limit", "plan limit", "credits")):
+        return "quota"
+    if http_status and 500 <= http_status < 600:
+        return "server_error"
+    if "timeout" in normalized or "timed out" in normalized:
+        return "timeout"
+    if any(token in normalized for token in ("missing", "not set", "not installed", "not found", "config")):
+        return "config"
+    return "unknown"
+
+
+def _should_disable_for_run(error_class: str) -> bool:
+    return error_class in {"auth", "quota", "config"}
+
+
+def _normalize_force_failures(values: list[str]) -> set[str]:
+    forced: set[str] = set()
+    for raw in values:
+        for token in raw.split(","):
+            token = token.strip().lower()
+            if token:
+                forced.add(token)
+    return forced
+
+
+def _is_forced_failure(force_failures: set[str], provider_type: str, provider_name: str) -> bool:
+    return (
+        provider_name.lower() in force_failures
+        or f"{provider_type}:{provider_name}".lower() in force_failures
+    )
+
+
+def _dedupe_evidence(items: list[EvidenceItem]) -> list[EvidenceItem]:
+    deduped: list[EvidenceItem] = []
+    seen: set[str] = set()
+    for item in items:
+        dedupe_key = item.url or f"{item.title}|{item.query}"
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        deduped.append(item)
+    return deduped
+
+
+def _evidence_to_block(items: list[EvidenceItem], *, max_items: int = 12) -> str:
+    blocks = []
+    for item in items[:max_items]:
+        blocks.append(
+            "\n".join(
+                [
+                    f"Provider: {item.provider_name}",
+                    f"Query: {item.query}",
+                    f"Title: {item.title}",
+                    f"URL: {item.url}",
+                    f"Published: {item.published_date or 'Unknown'}",
+                    f"Snippet: {item.snippet or 'No snippet'}",
+                ]
+            )
+        )
+    return "\n\n---\n\n".join(blocks)
+
+
+def _provider_failure(
+    exc: ProviderExecutionError,
+    *,
+    section: str,
+    fallback_hop: int,
+) -> ProviderFailure:
+    return ProviderFailure(
+        provider_type=exc.provider_type,
+        provider_name=exc.provider_name,
+        error_class=exc.error_class,
+        error_message=exc.error_message,
+        http_status=exc.http_status,
+        section=section,
+        fallback_hop=fallback_hop,
+    )
+
+
+def _run_tavily_search(
+    queries: list[str],
+    *,
+    surface: str,
+    domains: list[str] | None = None,
+    max_results: int = 5,
+) -> list[EvidenceItem]:
+    config = get_config()
+    if not TAVILY_AVAILABLE:
+        raise ProviderExecutionError("search", "tavily", "config", "tavily package not installed")
+    if not config.get("tavily_api_key"):
+        raise ProviderExecutionError("search", "tavily", "config", "TAVILY_API_KEY not set")
+
+    client = TavilyClient(api_key=config["tavily_api_key"])
+    evidence: list[EvidenceItem] = []
+    for query in queries:
+        try:
+            payload: dict[str, Any] = {
+                "query": query,
+                "search_depth": "advanced",
+                "max_results": max_results,
+            }
+            if domains:
+                payload["include_domains"] = domains
+            response = client.search(**payload)
+        except Exception as exc:
+            raise ProviderExecutionError(
+                "search",
+                "tavily",
+                _classify_error(str(exc)),
+                str(exc),
+            ) from exc
+
+        for result in response.get("results", []):
+            evidence.append(
+                EvidenceItem(
+                    title=result.get("title", ""),
+                    url=result.get("url", ""),
+                    snippet=result.get("content", ""),
+                    published_date=result.get("published_date", ""),
+                    query=query,
+                    provider_name="tavily",
+                    surface=surface,
+                )
+            )
+        time.sleep(0.2)
+
+    return _dedupe_evidence(evidence)
+
+
+def _run_brave_search_batch(
+    queries: list[str],
+    *,
+    surface: str,
+    domains: list[str] | None = None,
+    max_results: int = 5,
+) -> list[EvidenceItem]:
+    config = get_config()
+    if not config.get("brave_api_key"):
+        raise ProviderExecutionError("search", "brave", "config", "BRAVE_API_KEY not set")
+
+    headers = {
+        "X-Subscription-Token": config["brave_api_key"],
+        "Accept": "application/json",
+    }
+    evidence: list[EvidenceItem] = []
+    for query in queries:
+        query_text = query
+        if domains and len(domains) == 1 and f"site:{domains[0]}" not in query:
+            query_text = f"site:{domains[0]} {query}"
+        try:
+            response = requests.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                headers=headers,
+                params={"q": query_text, "count": max_results},
+                timeout=20,
+            )
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response else None
+            raise ProviderExecutionError(
+                "search",
+                "brave",
+                _classify_error(str(exc), status),
+                str(exc),
+                http_status=status,
+            ) from exc
+        except requests.RequestException as exc:
+            raise ProviderExecutionError(
+                "search",
+                "brave",
+                _classify_error(str(exc)),
+                str(exc),
+            ) from exc
+
+        for result in response.json().get("web", {}).get("results", []):
+            evidence.append(
+                EvidenceItem(
+                    title=result.get("title", ""),
+                    url=result.get("url", ""),
+                    snippet=result.get("description", ""),
+                    query=query_text,
+                    provider_name="brave",
+                    surface=surface,
+                )
+            )
+
+    return _dedupe_evidence(evidence)
+
+
+def _run_perplexity_search(
+    queries: list[str],
+    *,
+    surface: str,
+    domains: list[str] | None = None,
+    max_results: int = 5,
+) -> list[EvidenceItem]:
+    config = get_config()
+    api_key = config.get("perplexity_api_key")
+    if not api_key:
+        raise ProviderExecutionError("search", "perplexity", "config", "PERPLEXITY_API_KEY not set")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    evidence: list[EvidenceItem] = []
+    for query in queries:
+        payload: dict[str, Any] = {
+            "query": query,
+            "max_results": max_results,
+            "max_tokens_per_page": 1024,
+        }
+        if domains:
+            payload["search_domain_filter"] = domains
+        try:
+            response = requests.post(
+                "https://api.perplexity.ai/search",
+                headers=headers,
+                json=payload,
+                timeout=30,
+            )
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response else None
+            raise ProviderExecutionError(
+                "search",
+                "perplexity",
+                _classify_error(str(exc), status),
+                str(exc),
+                http_status=status,
+            ) from exc
+        except requests.RequestException as exc:
+            raise ProviderExecutionError(
+                "search",
+                "perplexity",
+                _classify_error(str(exc)),
+                str(exc),
+            ) from exc
+
+        for result in response.json().get("results", []):
+            evidence.append(
+                EvidenceItem(
+                    title=result.get("title", ""),
+                    url=result.get("url", ""),
+                    snippet=result.get("snippet", ""),
+                    published_date=result.get("date", ""),
+                    query=query,
+                    provider_name="perplexity",
+                    surface=surface,
+                )
+            )
+
+    return _dedupe_evidence(evidence)
+
+
+SEARCH_PROVIDER_EXECUTORS = {
+    "tavily": _run_tavily_search,
+    "brave": _run_brave_search_batch,
+    "perplexity": _run_perplexity_search,
+}
+
+
+def _search_with_fallbacks(
+    section_name: str,
+    queries: list[str],
+    *,
+    logger: JsonlLogger,
+    provider_health: dict[str, str],
+    force_failures: set[str],
+    domains: list[str] | None = None,
+    max_results: int = 5,
+) -> tuple[list[EvidenceItem], list[str], list[ProviderFailure]]:
+    evidence: list[EvidenceItem] = []
+    attempted_providers: list[str] = []
+    provider_failures: list[ProviderFailure] = []
+
+    for fallback_hop, provider_name in enumerate(SEARCH_PROVIDER_ORDER):
+        health_key = f"search:{provider_name}"
+        if provider_health.get(health_key) == "disabled_for_run":
+            logger.log(
+                section=section_name,
+                provider_type="search",
+                provider_name=provider_name,
+                fallback_hop=fallback_hop,
+                status="skipped_disabled",
+            )
+            continue
+
+        attempted_providers.append(provider_name)
+        start_time = time.time()
+        try:
+            if _is_forced_failure(force_failures, "search", provider_name):
+                raise ProviderExecutionError(
+                    "search",
+                    provider_name,
+                    "forced_failure",
+                    f"forced failure for {provider_name}",
+                )
+            evidence = SEARCH_PROVIDER_EXECUTORS[provider_name](
+                queries,
+                surface=section_name,
+                domains=domains,
+                max_results=max_results,
+            )
+            duration_ms = int((time.time() - start_time) * 1000)
+            logger.log(
+                section=section_name,
+                provider_type="search",
+                provider_name=provider_name,
+                query_kind=section_name,
+                attempt=1,
+                duration_ms=duration_ms,
+                status="success" if evidence else "empty",
+                fallback_hop=fallback_hop,
+            )
+            if evidence:
+                return evidence, attempted_providers, provider_failures
+        except ProviderExecutionError as exc:
+            duration_ms = int((time.time() - start_time) * 1000)
+            provider_failures.append(
+                _provider_failure(exc, section=section_name, fallback_hop=fallback_hop)
+            )
+            provider_health[health_key] = (
+                "disabled_for_run" if _should_disable_for_run(exc.error_class) else "degraded"
+            )
+            logger.log(
+                section=section_name,
+                provider_type="search",
+                provider_name=provider_name,
+                query_kind=section_name,
+                attempt=1,
+                duration_ms=duration_ms,
+                status="failure",
+                http_status=exc.http_status,
+                error_class=exc.error_class,
+                error_message=exc.error_message,
+                fallback_hop=fallback_hop,
+            )
+
+    return evidence, attempted_providers, provider_failures
+
+
+def _synthesize_with_fallbacks(
+    section_name: str,
+    prompt: str,
+    *,
+    logger: JsonlLogger,
+    provider_health: dict[str, str],
+    force_failures: set[str],
+    temperature: float = 0.3,
+    max_tokens: int = 4096,
+) -> tuple[str, list[str], list[ProviderFailure]]:
+    attempted_profiles: list[str] = []
+    provider_failures: list[ProviderFailure] = []
+
+    for fallback_hop, profile_name in enumerate(SYNTHESIS_PROFILE_ORDER):
+        health_key = f"synthesis:{profile_name}"
+        if provider_health.get(health_key) == "disabled_for_run":
+            logger.log(
+                section=section_name,
+                provider_type="synthesis",
+                provider_name=profile_name,
+                fallback_hop=fallback_hop,
+                status="skipped_disabled",
+            )
+            continue
+
+        attempted_profiles.append(profile_name)
+        start_time = time.time()
+        try:
+            if _is_forced_failure(force_failures, "synthesis", profile_name):
+                raise ProviderExecutionError(
+                    "synthesis",
+                    profile_name,
+                    "forced_failure",
+                    f"forced failure for {profile_name}",
+                )
+            gateway = LLMGateway(profile=profile_name)
+            result = gateway.chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            ).strip()
+            if not result:
+                raise ProviderExecutionError(
+                    "synthesis",
+                    profile_name,
+                    "empty",
+                    f"{profile_name} returned an empty response",
+                )
+
+            duration_ms = int((time.time() - start_time) * 1000)
+            logger.log(
+                section=section_name,
+                provider_type="synthesis",
+                provider_name=profile_name,
+                attempt=1,
+                duration_ms=duration_ms,
+                status="success",
+                fallback_hop=fallback_hop,
+            )
+            return result, attempted_profiles, provider_failures
+        except ProviderExecutionError as exc:
+            duration_ms = int((time.time() - start_time) * 1000)
+            provider_failures.append(
+                _provider_failure(exc, section=section_name, fallback_hop=fallback_hop)
+            )
+            provider_health[health_key] = (
+                "disabled_for_run" if _should_disable_for_run(exc.error_class) else "degraded"
+            )
+            logger.log(
+                section=section_name,
+                provider_type="synthesis",
+                provider_name=profile_name,
+                attempt=1,
+                duration_ms=duration_ms,
+                status="failure",
+                error_class=exc.error_class,
+                error_message=exc.error_message,
+                fallback_hop=fallback_hop,
+            )
+        except Exception as exc:  # pragma: no cover - runtime dependency
+            duration_ms = int((time.time() - start_time) * 1000)
+            error_class = _classify_error(str(exc))
+            provider_failures.append(
+                asdict(
+                    ProviderFailure(
+                        provider_type="synthesis",
+                        provider_name=profile_name,
+                        error_class=error_class,
+                        error_message=str(exc),
+                        section=section_name,
+                        fallback_hop=fallback_hop,
+                    )
+                )
+            )
+            provider_health[health_key] = (
+                "disabled_for_run" if _should_disable_for_run(error_class) else "degraded"
+            )
+            logger.log(
+                section=section_name,
+                provider_type="synthesis",
+                provider_name=profile_name,
+                attempt=1,
+                duration_ms=duration_ms,
+                status="failure",
+                error_class=error_class,
+                error_message=str(exc),
+                fallback_hop=fallback_hop,
+            )
+
+    normalized_failures = [
+        failure if isinstance(failure, dict) else asdict(failure)
+        for failure in provider_failures
+    ]
+    return "", attempted_profiles, normalized_failures
+
+
+def _company_queries(company_name: str, domain: str) -> list[str]:
+    return [
+        f'"{company_name}" company overview {domain}',
+        f'"{company_name}" funding investors',
+        f'"{company_name}" annual revenue employees',
+        f'"{company_name}" customers case study',
+        f'"{company_name}" product platform',
+        f'"{company_name}" news 2025 2026',
+    ]
+
+
+def _contact_queries(company_name: str) -> list[str]:
+    return [
+        f'site:linkedin.com/in "{company_name}" CEO',
+        f'site:linkedin.com/in "{company_name}" CMO',
+        f'site:linkedin.com/in "{company_name}" CRO',
+        f'site:linkedin.com/in "{company_name}" Founder',
+        f'site:linkedin.com/in "{company_name}" "VP Marketing"',
+        f'site:linkedin.com/in "{company_name}" "Director Marketing"',
+        f'site:linkedin.com/in "{company_name}" "Demand Generation"',
+        f'site:linkedin.com/in "{company_name}" ABM',
+        f'site:linkedin.com/in "{company_name}" "Marketing Operations"',
+        f'site:linkedin.com/in "{company_name}" "Revenue Operations"',
+        f'site:linkedin.com/in "{company_name}" "VP Sales"',
+    ]
+
+
+def _news_queries(company_name: str, domain: str) -> list[str]:
+    del domain
+    return [
+        f'"{company_name}" press release',
+        f'"{company_name}" product launch',
+        f'"{company_name}" partnership announcement',
+        f'"{company_name}" executive hire',
+        f'"{company_name}" funding round',
+    ]
+
+
+def _build_company_prompt(company_name: str, apollo_data: dict[str, Any], evidence: list[EvidenceItem]) -> str:
+    apollo_block = json.dumps(
+        {
+            "name": apollo_data.get("name", company_name),
+            "industry": apollo_data.get("industry", ""),
+            "estimated_employees": apollo_data.get("estimated_employees"),
+            "annual_revenue": apollo_data.get("annual_revenue"),
+            "latest_funding_round_type": apollo_data.get("latest_funding_round_type"),
+            "latest_funding_round_date": apollo_data.get("latest_funding_round_date"),
+            "keywords": apollo_data.get("keywords", []),
+        },
+        indent=2,
+    )
+    return f"""# ROLE
+Act as a Senior Investment Analyst specializing in venture-backed software companies.
+
+# COMPANY
+{company_name}
+
+# APOLLO BASELINE
+{apollo_block}
+
+# RAW WEB EVIDENCE
+{_evidence_to_block(evidence)}
+
+# TASK
+Use only the evidence above plus the Apollo baseline to produce a clean company deep dive.
+
+# FORMAT
+Plain text only. No markdown.
+
+EXECUTIVE SUMMARY
+
+[2-3 paragraphs]
+
+1. SNAPSHOT AND MARKET PRESENCE
+
+LinkedIn Employee Count: ...
+Estimated Annual Revenue: ...
+Estimated Company Value: ...
+Status: ...
+
+2. FUNDING AND CAPITAL STRUCTURE
+
+Total Funding Raised: ...
+Latest Funding Round: ...
+Funding History:
+...
+Key Investors: ...
+
+3. BUSINESS MODEL AND OPERATIONS
+
+Revenue Model: ...
+Key Customer Logos: ...
+Operational Scale: ...
+
+4. COMPANY NARRATIVE AND PRODUCT
+
+History: ...
+Product Overview: ...
+Product Differentiation: ...
+
+If a data point is uncertain, provide a bounded estimate and say what evidence supports it."""
+
+
+def _build_techstack_prompt(company_name: str, apollo_tech: list[dict[str, Any]], scraped_tech: list[str]) -> str:
+    all_tech = []
+    for tech in apollo_tech:
+        all_tech.append(f"{tech['name']} (Category: {tech['category']}) [Source: Apollo]")
+    for tech in scraped_tech:
+        all_tech.append(f"{tech} [Source: Website Scrape]")
+    tech_data = "\n".join(all_tech) if all_tech else "No technologies detected"
+    return f"""# ROLE
+Act as a RevOps technologist analyzing the marketing and sales stack for {company_name}.
+
+# RAW DATA
+{tech_data}
+
+# TASK
+Identify only go-to-market tools. Ignore engineering, security, IT, and hosting products.
+
+# FORMAT
+Plain text only. No markdown.
+
+CRM
+...
+
+Marketing Automation (MAP)
+...
+
+ABM & Intent
+...
+
+Sales Engagement (SEP)
+...
+
+Conversational / Chat
+...
+
+CMS / Web
+...
+
+Analytics & Attribution
+...
+
+Event / Webinar
+...
+
+Other RevTech
+...
+
+Only include categories where tools were found."""
+
+
+def _extract_profiles_from_evidence(evidence: list[EvidenceItem]) -> dict[str, dict[str, str]]:
+    profiles: dict[str, dict[str, str]] = {}
+    for item in evidence:
+        if "linkedin.com/in/" not in item.url:
+            continue
+        profiles[item.url] = {
+            "url": item.url,
+            "title": item.title,
+            "snippet": item.snippet,
+            "query": item.query,
+        }
+    return profiles
+
+
+_COMPANY_SUFFIX_TOKENS = (
+    "co",
+    "co.",
+    "company",
+    "corp",
+    "corp.",
+    "corporation",
+    "inc",
+    "inc.",
+    "llc",
+    "ltd",
+    "ltd.",
+    "limited",
+    "group",
+    "holdings",
+    "software",
+    "systems",
+    "technologies",
+    "technology",
+)
+
+
+def _bucket_for_profile(profile: dict[str, str]) -> str:
+    haystack = " ".join(
+        [
+            profile.get("title", ""),
+            profile.get("snippet", ""),
+            profile.get("query", ""),
+        ]
+    ).lower()
+    marketing_tokens = (
+        "marketing",
+        "demand",
+        "abm",
+        "abx",
+        "growth",
+        "field marketing",
+        "product marketing",
+        "content marketing",
+        "revops",
+        "revenue operations",
+    )
+    if any(token in haystack for token in marketing_tokens):
+        return "MARKETING"
+    return "LEADERSHIP"
+
+
+def _profile_explicitly_mentions_company(profile: dict[str, str], company_name: str) -> bool:
+    title = profile.get("title", "")
+    snippet = profile.get("snippet", "")
+    search_text = re.sub(r"\s+", " ", f"{title} {snippet}".strip())
+    normalized_company = re.sub(r"\s+", " ", company_name.strip())
+    if not search_text or not normalized_company:
+        return False
+
+    lowered_title = re.sub(r"\s+", " ", title.strip()).lower()
+    lowered_snippet = re.sub(r"\s+", " ", snippet.strip()).lower()
+    lowered_text = search_text.lower()
+    lowered_company = normalized_company.lower()
+    if lowered_company not in lowered_text:
+        return False
+
+    company_tokens = lowered_company.split()
+    if len(company_tokens) > 1:
+        return True
+
+    company_token = re.escape(company_tokens[0])
+    suffix_pattern = "|".join(re.escape(token) for token in _COMPANY_SUFFIX_TOKENS)
+
+    title_employer_cues = (
+        rf"\s-\s{company_token}(?=\s+\|\slinkedin\b)",
+        rf"\bat\s+{company_token}(?=\s*(?:[,|()/-]|$))",
+        rf"\b{company_token}\s+(?:{suffix_pattern})\b",
+    )
+    snippet_employer_cues = (
+        rf"\bexperience:\s*{company_token}(?=\s*(?:[,|()/-]|$))",
+        rf"\bat\s+{company_token}(?=\s*(?:[,|()/-]|$))",
+        rf"\b(?:cmo|ceo|cro|cfo|coo|cto|chief [a-z ]+ officer|director|vp|vice president|head|lead|manager)\b[^.]{0,80}\b{company_token}\b",
+    )
+    return any(re.search(pattern, lowered_title) for pattern in title_employer_cues) or any(
+        re.search(pattern, lowered_snippet) for pattern in snippet_employer_cues
+    )
+
+
+def _build_contacts_prompt(company_name: str, profiles: dict[str, dict[str, str]]) -> str:
+    lines: list[str] = []
+    for profile in profiles.values():
+        lines.extend(
+            [
+                f"Bucket: {_bucket_for_profile(profile)}",
+                f"URL: {profile['url']}",
+                f"Title/Name from Search: {profile.get('title', '')}",
+                f"Snippet: {profile.get('snippet', '')}",
+                f"Search Query Used: {profile.get('query', '')}",
+                "---",
+            ]
+        )
+    profiles_text = "\n".join(lines)
+    return f"""# ROLE
+Act as an Executive Sales Researcher formatting LinkedIn contact data for {company_name}.
+
+# RAW DATA
+{profiles_text}
+
+# TASK
+Output two sections in this exact order:
+
+Marketing
+Then a divider line:
+--- LEADERSHIP ---
+Then Leadership
+
+# FORMAT
+Plain text only. No markdown.
+
+CONTACT NAME
+Title: [Current title at {company_name}]
+LinkedIn: [full linkedin.com/in URL]
+Location: [City, State/Country or "Verify on profile"]
+Insight: [brief background note]
+
+Use one blank line between contacts. Only include people who appear to work at {company_name}.
+Exclude people who merely mention Asana as a tool, skill, client, or adjacent brand name."""
+
+
+def _build_news_prompt(company_name: str, evidence: list[EvidenceItem]) -> str:
+    return f"""# ROLE
+You are a business research analyst summarizing recent news about {company_name}.
+
+# RAW NEWS DATA
+{_evidence_to_block(evidence)}
+
+# TASK
+Summarize the most relevant 5-10 items in plain text.
+
+# FORMAT
+[Date or "Recent"] - [Headline]
+Source: [Publication Name]
+Summary: [2-3 sentences]
+
+Use a blank line between items. Focus on funding, partnerships, products, and executive changes."""
+
+
+def _build_champion_text(
+    champion_name: str,
+    company_name: str,
+    *,
+    logger: JsonlLogger,
+    provider_health: dict[str, str],
+    force_failures: set[str],
+) -> tuple[str | None, str | None]:
+    config = get_config()
+    if not config.get("gemini_api_key"):
+        return None, None
+
+    champion_text, champion_url = search_champion_contact(champion_name, company_name)
+    if champion_text:
+        logger.log(
+            section="contacts",
+            provider_type="search",
+            provider_name="gemini_optional_champion",
+            status="success",
+        )
+        return champion_text, champion_url
+
+    logger.log(
+        section="contacts",
+        provider_type="search",
+        provider_name="gemini_optional_champion",
+        status="empty",
+    )
+    return None, None
+
+
+def _run_company_section(
+    company_name: str,
+    domain: str,
+    apollo_data: dict[str, Any],
+    *,
+    logger: JsonlLogger,
+    provider_health: dict[str, str],
+    force_failures: set[str],
+) -> SectionResult:
+    evidence, provider_chain, provider_failures = _search_with_fallbacks(
+        "company_research",
+        _company_queries(company_name, domain),
+        logger=logger,
+        provider_health=provider_health,
+        force_failures=force_failures,
+        max_results=4,
+    )
+    if not evidence:
+        status = "provider_failed" if provider_failures else "no_results_valid"
+        return SectionResult(
+            name="company_research",
+            status=status,
+            raw_evidence=[asdict(item) for item in evidence],
+            provider_chain=provider_chain,
+            provider_failures=[asdict(failure) for failure in provider_failures],
+            notes="No viable search evidence gathered for company research.",
+        )
+
+    content, synth_chain, synth_failures = _synthesize_with_fallbacks(
+        "company_research",
+        _build_company_prompt(company_name, apollo_data, evidence),
+        logger=logger,
+        provider_health=provider_health,
+        force_failures=force_failures,
+        temperature=0.3,
+        max_tokens=8192,
+    )
+    all_failures = [asdict(failure) for failure in provider_failures]
+    all_failures.extend(synth_failures)
+    return SectionResult(
+        name="company_research",
+        status="ok" if content else "synthesis_failed",
+        content=content,
+        raw_evidence=[asdict(item) for item in evidence],
+        provider_chain=provider_chain + synth_chain,
+        provider_failures=all_failures,
+    )
+
+
+def _run_techstack_section(
+    company_name: str,
+    apollo_data: dict[str, Any],
+    scraped_tech: list[str],
+    *,
+    logger: JsonlLogger,
+    provider_health: dict[str, str],
+    force_failures: set[str],
+) -> SectionResult:
+    apollo_tech = apollo_data.get("tech_stack", [])
+    raw_evidence = [{"apollo_tech": apollo_tech, "scraped_tech": scraped_tech}]
+    if not apollo_tech and not scraped_tech:
+        logger.log(section="techstack", provider_type="data", provider_name="apollo_scrape", status="empty")
+        return SectionResult(
+            name="techstack",
+            status="no_results_valid",
+            raw_evidence=raw_evidence,
+            notes="Apollo and site scraping returned no tech signals.",
+        )
+
+    content, synth_chain, synth_failures = _synthesize_with_fallbacks(
+        "techstack",
+        _build_techstack_prompt(company_name, apollo_tech, scraped_tech),
+        logger=logger,
+        provider_health=provider_health,
+        force_failures=force_failures,
+        temperature=0.2,
+        max_tokens=2048,
+    )
+    return SectionResult(
+        name="techstack",
+        status="ok" if content else "synthesis_failed",
+        content=content,
+        raw_evidence=raw_evidence,
+        provider_chain=synth_chain,
+        provider_failures=synth_failures,
+    )
+
+
+def _run_contacts_section(
+    company_name: str,
+    champion_name: str | None,
+    *,
+    logger: JsonlLogger,
+    provider_health: dict[str, str],
+    force_failures: set[str],
+) -> SectionResult:
+    evidence, provider_chain, provider_failures = _search_with_fallbacks(
+        "contacts",
+        _contact_queries(company_name),
+        logger=logger,
+        provider_health=provider_health,
+        force_failures=force_failures,
+        domains=["linkedin.com"],
+        max_results=4,
+    )
+    profiles = _extract_profiles_from_evidence(evidence)
+    profiles = {
+        url: profile
+        for url, profile in profiles.items()
+        if _profile_explicitly_mentions_company(profile, company_name)
+    }
+    profiles = validate_and_fix_linkedin_urls(profiles, company_name)
+    if len(profiles) < 3:
+        status = "provider_failed" if provider_failures and not profiles else "no_results_valid"
+        return SectionResult(
+            name="contacts",
+            status=status,
+            raw_evidence=[asdict(item) for item in evidence],
+            provider_chain=provider_chain,
+            provider_failures=[asdict(failure) for failure in provider_failures],
+            notes=f"Only {len(profiles)} valid LinkedIn profiles matched explicit employer cues.",
+        )
+
+    content, synth_chain, synth_failures = _synthesize_with_fallbacks(
+        "contacts",
+        _build_contacts_prompt(company_name, profiles),
+        logger=logger,
+        provider_health=provider_health,
+        force_failures=force_failures,
+        temperature=0.2,
+        max_tokens=4096,
+    )
+    if not content:
+        return SectionResult(
+            name="contacts",
+            status="synthesis_failed",
+            raw_evidence=[asdict(item) for item in evidence],
+            provider_chain=provider_chain + synth_chain,
+            provider_failures=[asdict(failure) for failure in provider_failures] + synth_failures,
+        )
+
+    champion_text = None
+    champion_url = None
+    if champion_name:
+        champion_text, champion_url = _build_champion_text(
+            champion_name,
+            company_name,
+            logger=logger,
+            provider_health=provider_health,
+            force_failures=force_failures,
+        )
+        if champion_text:
+            if "Insight:" not in champion_text:
+                champion_text += "\nInsight: Deal champion for this opportunity"
+            else:
+                champion_text = champion_text.replace(
+                    "Insight:",
+                    "Insight: Deal champion for this opportunity. ",
+                    1,
+                )
+            content = deduplicate_champion_from_contacts(content, champion_url, champion_name)
+            content = f"CHAMPION\n{champion_text}\n\n{content}"
+
+    content, url_mappings = extract_and_strip_linkedin_lines(content)
+    if champion_name and not champion_text:
+        placeholder = (
+            f"CHAMPION\n{champion_name}\nTitle: Verify on profile\n"
+            f"LinkedIn: Search manually\nInsight: Deal champion for this opportunity\n\n"
+        )
+        content = placeholder + content
+
+    return SectionResult(
+        name="contacts",
+        status="ok",
+        content=content,
+        raw_evidence=[asdict(item) for item in evidence],
+        provider_chain=provider_chain + synth_chain,
+        provider_failures=[asdict(failure) for failure in provider_failures] + synth_failures,
+        url_mappings=url_mappings,
+    )
+
+
+def _run_news_section(
+    company_name: str,
+    domain: str,
+    *,
+    logger: JsonlLogger,
+    provider_health: dict[str, str],
+    force_failures: set[str],
+) -> SectionResult:
+    evidence, provider_chain, provider_failures = _search_with_fallbacks(
+        "news",
+        _news_queries(company_name, domain),
+        logger=logger,
+        provider_health=provider_health,
+        force_failures=force_failures,
+        max_results=4,
+    )
+    if not evidence:
+        return SectionResult(
+            name="news",
+            status="no_results_valid" if not provider_failures else "provider_failed",
+            raw_evidence=[asdict(item) for item in evidence],
+            provider_chain=provider_chain,
+            provider_failures=[asdict(failure) for failure in provider_failures],
+            notes="No recent news evidence was gathered.",
+        )
+
+    content, synth_chain, synth_failures = _synthesize_with_fallbacks(
+        "news",
+        _build_news_prompt(company_name, evidence),
+        logger=logger,
+        provider_health=provider_health,
+        force_failures=force_failures,
+        temperature=0.2,
+        max_tokens=3072,
+    )
+    status = "ok" if content else "synthesis_failed"
+    return SectionResult(
+        name="news",
+        status=status,
+        content=content,
+        raw_evidence=[asdict(item) for item in evidence],
+        provider_chain=provider_chain + synth_chain,
+        provider_failures=[asdict(failure) for failure in provider_failures] + synth_failures,
+    )
+
+
+def _evaluate_run_status(sections: dict[str, SectionResult]) -> tuple[str, list[str], list[str], str]:
+    failed_sections = [
+        name for name in REQUIRED_SECTION_NAMES if sections[name].status != "ok"
+    ]
+    degraded_sections = [
+        name
+        for name in OPTIONAL_SECTION_NAMES
+        if sections[name].status not in {"ok", "no_results_valid"}
+    ]
+    if failed_sections:
+        return "blocked", failed_sections, degraded_sections, "quality gate failed"
+    return "success", failed_sections, degraded_sections, ""
+
+
+def _serializable_run_result(result: ResearchRunResult) -> dict[str, Any]:
+    payload = asdict(result)
+    payload["sections"] = {
+        name: asdict(section) if isinstance(section, SectionResult) else section
+        for name, section in result.sections.items()
+    }
+    return payload
+
+
+def run_research(
+    company_name: str,
+    domain: str,
+    champion_name: str | None = None,
+    *,
+    skip_browser: bool = False,
+    force_failures: set[str] | None = None,
+    smoke_test: bool = False,
+) -> ResearchRunResult:
+    force_failures = force_failures or set()
+    run_id = os.environ.get("DEAL_RESEARCH_RUN_ID", f"deal-{uuid.uuid4().hex[:12]}")
+    logger = JsonlLogger(run_id, company_name, domain)
+    provider_health: dict[str, str] = {}
+    created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     print(f"\n{'='*60}")
-    print(f"Deal Research Generator")
+    print("Deal Research Generator")
     print(f"{'='*60}")
+    print(f"Run ID: {run_id}")
     print(f"Company: {company_name}")
     print(f"Domain: {domain}")
     if champion_name:
         print(f"Champion: {champion_name}")
     print(f"{'='*60}\n")
 
-    # Step 1: Fetch Apollo data
-    print("[Step 1/6] Fetching company data from Apollo API...")
-    apollo_data = fetch_apollo_data(domain)
-    if not apollo_data:
-        apollo_data = {
-            "name": company_name,
-            "domain": domain,
-            "tech_stack": []
-        }
-        print("  Warning: Using minimal data (Apollo enrichment failed)")
+    logger.log(section="run", provider_type="workflow", provider_name="deal_research", status="started")
 
-    # Step 2: Scrape website for tech stack
+    print("[Step 1/6] Fetching company data from Apollo API...")
+    apollo_data = fetch_apollo_data(domain) or {
+        "name": company_name,
+        "domain": domain,
+        "tech_stack": [],
+    }
+    if not apollo_data.get("industry"):
+        print("  Warning: Apollo enrichment returned partial data")
+
     print("\n[Step 2/6] Scanning website for tech stack...")
     scraped_tech = scrape_website_tech_stack(domain)
 
-    # Step 3: Generate LLM-synthesized sections
-    print("\n[Step 3/6] Generating research sections with Gemini...")
-
-    print("\n  Generating Company Research...")
-    company_research = generate_company_research(apollo_data, company_name)
-    if not company_research:
-        company_research = "Error generating company research. Please add manually."
-
-    print("\n  Generating TechStack analysis...")
-    techstack = generate_techstack_analysis(
-        apollo_data.get("tech_stack", []),
-        scraped_tech,
-        company_name
+    print("\n[Step 3/6] Generating company research...")
+    company_section = _run_company_section(
+        company_name,
+        domain,
+        apollo_data,
+        logger=logger,
+        provider_health=provider_health,
+        force_failures=force_failures,
     )
-    if not techstack:
-        techstack = "Error generating tech stack analysis. Please add manually."
 
-    # Step 4: Deep research for LinkedIn contacts using Tavily + Gemini
-    print("\n[Step 4/6] Searching for LinkedIn contacts...")
-    contacts = search_linkedin_contacts_with_tavily(company_name)
-    if not contacts:
-        contacts = "Error finding contacts. Please add manually."
+    print("\n[Step 4/6] Generating tech stack analysis...")
+    techstack_section = _run_techstack_section(
+        company_name,
+        apollo_data,
+        scraped_tech,
+        logger=logger,
+        provider_health=provider_health,
+        force_failures=force_failures,
+    )
 
-    # Champion search: find the champion, deduplicate, prepend to contacts.
-    # The champion is ALWAYS placed at the top of the Contacts section,
-    # even if the LinkedIn search doesn't find a profile URL.
-    if champion_name:
-        champion_text, champion_url = search_champion_contact(champion_name, company_name)
-        if champion_text:
-            # Inject champion insight if not already present
-            if "Insight:" not in champion_text:
-                champion_text += f"\nInsight: Deal champion for this opportunity"
-            else:
-                # Append champion note to existing insight
-                champion_text = champion_text.replace(
-                    "Insight:", "Insight: Deal champion for this opportunity."
-                )
-            contacts = deduplicate_champion_from_contacts(contacts, champion_url, champion_name)
-            contacts = f"CHAMPION\n{champion_text}\n\n{contacts}"
-        else:
-            # LinkedIn search failed -- still add the champion as a placeholder
-            contacts = deduplicate_champion_from_contacts(contacts, None, champion_name)
-            champion_placeholder = (
-                f"{champion_name}\n"
-                f"Title: Verify on profile\n"
-                f"LinkedIn: Search manually\n"
-                f"Insight: Deal champion for this opportunity"
-            )
-            contacts = f"CHAMPION\n{champion_placeholder}\n\n{contacts}"
+    print("\n[Step 5/6] Finding contacts...")
+    contacts_section = _run_contacts_section(
+        company_name,
+        champion_name,
+        logger=logger,
+        provider_health=provider_health,
+        force_failures=force_failures,
+    )
 
-    # Extract LinkedIn URLs and remove "LinkedIn:" lines from contacts text
-    contacts, url_mappings = extract_and_strip_linkedin_lines(contacts)
+    print("\n[Step 6/6] Gathering news and activity...")
+    news_section = _run_news_section(
+        company_name,
+        domain,
+        logger=logger,
+        provider_health=provider_health,
+        force_failures=force_failures,
+    )
 
-    # Step 5: Gather recent news and activity using Tavily
-    print("\n[Step 5/6] Gathering recent news and activity...")
-    news_and_activity = generate_news_and_activity(company_name, domain)
-    if not news_and_activity:
-        news_and_activity = "Error gathering news. Please add manually."
+    sections = {
+        "company_research": company_section,
+        "techstack": techstack_section,
+        "contacts": contacts_section,
+        "news": news_section,
+    }
+    status, failed_sections, degraded_sections, blocked_reason = _evaluate_run_status(sections)
 
-    # Step 6: Create Google Doc
-    doc_url = create_google_doc(company_name, company_research, techstack, contacts, news_and_activity, url_mappings=url_mappings)
-
-    # Summary
-    print(f"\n{'='*60}")
-    print("COMPLETE!")
-    print(f"{'='*60}")
-    if doc_url:
-        print(f"\nGoogle Doc: {doc_url}")
-        if not os.environ.get("SKIP_BROWSER"):
-            print("  Opening in browser...")
+    doc_created = False
+    doc_url = ""
+    if status == "success" and not smoke_test:
+        news_text = ""
+        if news_section.status == "ok":
+            news_text = news_section.content
+        elif news_section.status == "no_results_valid":
+            news_text = "No recent news found from the configured sources."
+        doc_url = create_google_doc(
+            company_name,
+            company_section.content,
+            techstack_section.content,
+            contacts_section.content,
+            news_text,
+            url_mappings=contacts_section.url_mappings,
+        )
+        doc_created = bool(doc_url)
+        if doc_url and not skip_browser and not os.environ.get("SKIP_BROWSER"):
             webbrowser.open(doc_url)
-    print(f"\nData collected:")
-    print(f"  - Apollo enrichment: {'Success' if apollo_data.get('industry') else 'Partial'}")
-    print(f"  - Tech stack detected: {len(scraped_tech)} technologies from website")
-    print(f"  - LinkedIn contacts: Tavily + Gemini search completed")
-    print(f"  - News & Activity: Tavily search completed")
-    print(f"\n{'='*60}\n")
+    elif smoke_test:
+        status = "smoke_test"
+        blocked_reason = blocked_reason or "smoke test mode"
+
+    provider_failures: list[dict[str, Any]] = []
+    for section in sections.values():
+        provider_failures.extend(section.provider_failures)
+
+    result = ResearchRunResult(
+        run_id=run_id,
+        company_name=company_name,
+        domain=domain,
+        champion_name=champion_name,
+        status=status,
+        doc_created=doc_created,
+        doc_url=doc_url,
+        blocked_reason=blocked_reason,
+        failed_sections=failed_sections,
+        degraded_sections=degraded_sections,
+        provider_failures=provider_failures,
+        sections=sections,
+        jsonl_log_path=str(logger.path),
+        created_at=created_at,
+    )
+    logger.log(
+        section="run",
+        provider_type="workflow",
+        provider_name="deal_research",
+        status=status,
+        failed_sections=failed_sections,
+        degraded_sections=degraded_sections,
+        doc_created=doc_created,
+        doc_url=doc_url,
+    )
+    return result
+
+
+def run_doctor(*, json_output: bool = False) -> int:
+    config = get_config()
+    checks: list[dict[str, str]] = []
+    ok = True
+
+    def record(name: str, status: str, message: str) -> None:
+        nonlocal ok
+        if status != "ok":
+            ok = False
+        checks.append({"name": name, "status": status, "message": message})
+
+    for env_name in ("APOLLO_API_KEY", "GOOGLE_DRIVE_FOLDER_ID", "TAVILY_API_KEY", "BRAVE_API_KEY", "PERPLEXITY_API_KEY", "AI_DEEPSEEK_KEY", "AI_OPENAI_KEY"):
+        record(
+            env_name,
+            "ok" if os.environ.get(env_name) else "fail",
+            "present" if os.environ.get(env_name) else "missing",
+        )
+
+    try:
+        docs_service = build_service("docs", "v1")
+        docs_service.documents().get(documentId="does-not-exist").execute()
+    except Exception as exc:
+        if "Requested entity was not found" in str(exc):
+            record("google_docs_auth", "ok", "Google Docs auth works")
+        else:
+            record("google_docs_auth", "fail", str(exc))
+
+    try:
+        drive_service = build_service("drive", "v3")
+        drive_service.files().get(
+            fileId=config["google_drive_folder_id"],
+            fields="id,name",
+            supportsAllDrives=True,
+        ).execute()
+        record("google_drive_folder", "ok", "Drive folder reachable")
+    except Exception as exc:
+        record("google_drive_folder", "fail", str(exc))
+
+    probe_query = ["Acme software company"]
+    for provider_name in SEARCH_PROVIDER_ORDER:
+        try:
+            SEARCH_PROVIDER_EXECUTORS[provider_name](
+                probe_query,
+                surface="doctor",
+                max_results=1,
+            )
+            record(f"search_provider:{provider_name}", "ok", "probe succeeded")
+        except Exception as exc:
+            record(f"search_provider:{provider_name}", "fail", str(exc))
+
+    for profile_name in SYNTHESIS_PROFILE_ORDER:
+        try:
+            gateway = LLMGateway(profile=profile_name)
+            gateway.chat(
+                messages=[{"role": "user", "content": "Reply with OK"}],
+                temperature=0,
+                max_tokens=8,
+            )
+            record(f"synthesis_profile:{profile_name}", "ok", "probe succeeded")
+        except Exception as exc:
+            record(f"synthesis_profile:{profile_name}", "fail", str(exc))
+
+    payload = {
+        "ok": ok,
+        "checks": checks,
+        "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    if json_output:
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        for check in checks:
+            print(f"[{check['status'].upper()}] {check['name']}: {check['message']}")
+    return 0 if ok else 1
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    if argv and argv[0] == "doctor":
+        parser = argparse.ArgumentParser(prog="deal_research.py doctor")
+        parser.add_argument("command")
+        parser.add_argument("--json", action="store_true")
+        return parser.parse_args(argv)
+
+    parser = argparse.ArgumentParser(
+        prog="deal_research.py",
+        description="Generate a deal research document with explicit quality gating.",
+    )
+    parser.add_argument("company_name")
+    parser.add_argument("domain")
+    parser.add_argument("champion_name", nargs="?")
+    parser.add_argument("--json", action="store_true", help="Emit a machine-readable result line at the end.")
+    parser.add_argument("--no-browser", action="store_true", help="Do not open the final Google Doc in a browser.")
+    parser.add_argument(
+        "--force-failure",
+        action="append",
+        default=[],
+        help="Simulate a provider failure by name, e.g. tavily or synthesis:workhorse.",
+    )
+    parser.add_argument("--smoke-test", action="store_true", help="Run the workflow without creating the final doc.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv or sys.argv[1:])
+    if getattr(args, "command", None) == "doctor":
+        return run_doctor(json_output=args.json)
+
+    result = run_research(
+        args.company_name,
+        args.domain,
+        args.champion_name,
+        skip_browser=args.no_browser or args.json,
+        force_failures=_normalize_force_failures(args.force_failure),
+        smoke_test=args.smoke_test,
+    )
+
+    print(f"\n{'='*60}")
+    print("RUN SUMMARY")
+    print(f"{'='*60}")
+    print(f"Run ID: {result.run_id}")
+    print(f"Status: {result.status}")
+    if result.failed_sections:
+        print(f"Failed Sections: {', '.join(result.failed_sections)}")
+    if result.degraded_sections:
+        print(f"Degraded Sections: {', '.join(result.degraded_sections)}")
+    if result.doc_url:
+        print(f"Google Doc: {result.doc_url}")
+    if result.blocked_reason:
+        print(f"Blocked Reason: {result.blocked_reason}")
+    print(f"JSONL Log: {result.jsonl_log_path}")
+    print(f"{'='*60}\n")
+
+    if args.json:
+        print(f"{JSON_RESULT_PREFIX} {json.dumps(_serializable_run_result(result), sort_keys=True)}")
+
+    if result.status == "error":
+        return 1
+    if result.status == "blocked":
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
